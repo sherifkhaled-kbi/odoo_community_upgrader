@@ -44,7 +44,16 @@ logging.basicConfig(
     type=click.Path(),
     help="Path to log file"
 )
-def main(source, version, extra_addons, verbose, postgres_version, log_file):
+@click.option(
+    "--keep-db-on-failure",
+    is_flag=True,
+    help=(
+        "Keep the temporary PostgreSQL container and volume when a migration fails. "
+        "The default still deletes them. A later run refuses to delete a retained database "
+        "and prints the inspect and cleanup commands."
+    ),
+)
+def main(source, version, extra_addons, verbose, postgres_version, log_file, keep_db_on_failure):
     """
     Odoo Database Upgrade Tool.
 
@@ -65,7 +74,8 @@ def main(source, version, extra_addons, verbose, postgres_version, log_file):
         target_version=version,
         extra_addons=extra_addons,
         verbose=verbose,
-        postgres_version=postgres_version
+        postgres_version=postgres_version,
+        keep_db_on_failure=keep_db_on_failure,
     )
     upgrader.run()
 

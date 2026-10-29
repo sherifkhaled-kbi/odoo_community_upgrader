@@ -152,6 +152,9 @@ dmypy.json
 # pytype static type analyzer
 .pytype/
 
+# Generated during an upgrade run
+migration_build/
+
 # Cython debug symbols
 cython_debug/
 
