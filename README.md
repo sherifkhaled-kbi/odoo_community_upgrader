@@ -1,0 +1,1 @@
+# odoo_community_upgrader
