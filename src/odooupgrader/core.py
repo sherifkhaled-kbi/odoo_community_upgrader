@@ -479,9 +479,17 @@ USER root
 RUN apt-get update && apt-get install -y git && rm -rf /var/lib/apt/lists/*
 RUN git clone https://github.com/OCA/OpenUpgrade.git --depth 1 --branch {target_version} /mnt/extra-addons
 RUN if pip3 install --help | grep -q -- '--break-system-packages'; then \
-        pip3 install --break-system-packages --no-cache-dir -r /mnt/extra-addons/requirements.txt; \
+        pip3 install --break-system-packages --no-cache-dir \
+          -r /mnt/extra-addons/requirements.txt && \
+        pip3 install --break-system-packages --no-cache-dir \
+          --no-deps --force-reinstall \
+          "openupgradelib @ git+https://github.com/OCA/openupgradelib.git@565d0b33391271a4b2ac27eff8ae19f72fe27d77"; \
     else \
-        pip3 install --no-cache-dir -r /mnt/extra-addons/requirements.txt; \
+        pip3 install --no-cache-dir \
+          -r /mnt/extra-addons/requirements.txt && \
+        pip3 install --no-cache-dir \
+          --no-deps --force-reinstall \
+          "openupgradelib @ git+https://github.com/OCA/openupgradelib.git@565d0b33391271a4b2ac27eff8ae19f72fe27d77"; \
     fi
 
 {extra_addons_cmds}
