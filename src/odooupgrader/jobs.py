@@ -64,6 +64,36 @@ def require_space(path, required, reserve=256 * 1024 * 1024):
         raise RecoveryError('DISK_SPACE: insufficient space; retain checkpoints and free capacity explicitly')
 
 
+def allocated_bytes(root, seen=None):
+    """Read allocated blocks without following links or reading file contents."""
+    root = Path(root)
+    if not root.exists():
+        return 0
+    seen = set() if seen is None else seen
+    total = 0
+    if root.is_symlink():
+        return 0
+    root_info = root.stat(follow_symlinks=False)
+    root_identity = (root_info.st_dev, root_info.st_ino)
+    if root_identity not in seen:
+        seen.add(root_identity)
+        total += root_info.st_blocks * 512
+    if not root.is_dir():
+        return total
+    for parent, directories, files in os.walk(root, followlinks=False):
+        for name in directories + files:
+            path = Path(parent) / name
+            info = path.stat(follow_symlinks=False)
+            if path.is_symlink():
+                directories[:] = [item for item in directories if item != name]
+                continue
+            identity = (info.st_dev, info.st_ino)
+            if identity not in seen:
+                seen.add(identity)
+                total += info.st_blocks * 512
+    return total
+
+
 class Job:
     SCHEMA = 1
 

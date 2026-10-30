@@ -23,7 +23,7 @@ logger = logging.getLogger('odooupgrader')
 
 class RecoveryMixin:
     def _configure_recovery(self, jobs_dir, job_id, revisions, acceptance, reason, filestore,
-                            allow_missing_attachments, single_copy):
+                            allow_missing_attachments, single_copy, source_version):
         self.jobs_dir = Path(jobs_dir or Path.cwd() / '.odooupgrader' / 'jobs').resolve()
         self.job = Job(self.jobs_dir, job_id) if job_id else None
         if self.job and (self.target_version != self.job.data['target'] or self.postgres_version != self.job.data['postgres']):
@@ -39,6 +39,10 @@ class RecoveryMixin:
                                           if self.job else allow_missing_attachments)
         self.single_copy = (self.job.data['config'].get('single_copy', False)
                             if self.job else single_copy)
+        self.source_version_hint = (self.job.data['config'].get('source_version')
+                                    if self.job else source_version)
+        if self.source_version_hint and int(self.source_version_hint.split('.')[0]) > int(self.target_version.split('.')[0]):
+            raise RecoveryError('SOURCE_VERSION: source version cannot exceed target version')
         self._handler = None
         self.db_container = None
         self.network = None
@@ -51,6 +55,7 @@ class RecoveryMixin:
         self._database_restored = False
         self._restore_failed = False
         self.prepared_dump_path = None
+        self._last_filestore_fingerprint = None
 
     def _runtime_plan(self):
         package = Path(__file__).parent
@@ -89,13 +94,24 @@ class RecoveryMixin:
         return change, value
 
     def dry_run(self):
-        directory, manifest = self.job.checkpoint()
+        workspace = self._reusable_workspace(
+            allow_interrupted_running=self.job.observed_state() == 'INTERRUPTED')
+        if self.job.data['latest_checkpoint']:
+            directory, manifest = self.job.checkpoint()
+        elif workspace:
+            directory, manifest = None, {'version': workspace['workspace_ready']['version'],
+                'checkpoint_format': None, 'validation': {'independent_restore': False}}
+        else:
+            raise RecoveryError('NO_CHECKPOINT: no verified checkpoint or reusable pre-migration workspace')
         change, change_hash = self._plan_change(enforce=False)
-        return {'job_id': self.job.id, 'checkpoint': directory.name, 'version': manifest['version'],
+        return {'job_id': self.job.id, 'checkpoint': directory.name if directory else None, 'version': manifest['version'],
                 'target': self.job.data['target'], 'state': self.job.data['state'],
+                'reuse_pre_migration_workspace': bool(workspace),
                 'runtime_diff': change, 'change_sha256': change_hash,
                 'built_runtime_candidates': self.job.data.get('runtime_candidates', {}),
-                'deferred_checks': ['exclusive ownership', 'Docker reconciliation', 'fresh restore', 'registry verification', 'disk capacity'],
+                'deferred_checks': ['exclusive ownership', 'Docker reconciliation',
+                    'workspace identity and data validation' if workspace else 'fresh restore',
+                    'registry verification', 'disk capacity'],
                 'checkpoint_format': manifest.get('checkpoint_format', 'directory'),
                 'independent_restore_verified': manifest['validation'].get('independent_restore', True)}
 
@@ -112,7 +128,7 @@ class RecoveryMixin:
         subprocess.run(['docker', 'info', '--format', '{{.ID}}'], check=True, capture_output=True, text=True)
 
     def _inspect_owned(self, name, attempt_id):
-        result = subprocess.run(['docker', 'inspect', name], capture_output=True, text=True, timeout=10)
+        result = subprocess.run(['docker', 'container', 'inspect', name], capture_output=True, text=True, timeout=10)
         if result.returncode:
             if 'No such' in result.stderr:
                 return None
@@ -124,21 +140,34 @@ class RecoveryMixin:
         return info
 
     def _stop_attempt(self, attempt):
+        errors = []
         for name in reversed(attempt.get('containers', [])):
-            info = self._inspect_owned(name, attempt['id'])
-            if info and info['State']['Running']:
-                subprocess.run(['docker', 'stop', info['Id']], check=True, capture_output=True, timeout=30)
+            try:
+                info = self._inspect_owned(name, attempt['id'])
+                if info and info['State']['Running']:
+                    subprocess.run(['docker', 'stop', info['Id']], check=True, capture_output=True, timeout=30)
+            except Exception as exc:
+                errors.append((name, exc))
+        if errors:
+            names = ', '.join(name for name, _ in errors)
+            raise RecoveryError(f'DOCKER_STOP: could not stop or inspect attempt containers: {names}') from errors[0][1]
 
     def _new_attempt(self):
         attempt = self.job.begin()
         work = self.job.path / 'attempts' / attempt['id']
         work.mkdir(mode=0o700)
         attempt['work'] = str(work)
+        self._set_attempt_paths(attempt)
+        return attempt
+
+    def _set_attempt_paths(self, attempt):
+        work = self.job.path / 'attempts' / attempt['id']
         suffix = attempt['id'].replace('-', '')
         self.db_container = 'ou-db-' + suffix
         self.network = 'ou-net-' + suffix
-        attempt['containers'] = [self.db_container]
-        self.job.save()
+        if 'containers' not in attempt:
+            attempt['containers'] = [self.db_container]
+            self.job.save()
         self.cwd = str(work)
         self.source_dir = str(work / 'source')
         self.output_dir = str(work / 'output')
@@ -149,7 +178,64 @@ class RecoveryMixin:
         self._handler.addFilter(RedactionFilter())
         self._handler.setLevel(logging.DEBUG)
         logger.addHandler(self._handler)
+
+    def _reusable_workspace(self, allow_interrupted_running=False):
+        if not self.single_copy or not self.job or not self.job.data['attempts']:
+            return None
+        attempt = self.job.data['attempts'][-1]
+        ready = attempt.get('workspace_ready')
+        allowed = ('FAILED', 'INTERRUPTED', 'RUNNING') if allow_interrupted_running else ('FAILED', 'INTERRUPTED')
+        if (attempt['outcome'] not in allowed or not ready
+                or attempt.get('migration_started')):
+            return None
+        checkpoint = self.job.data['latest_checkpoint']
+        if not checkpoint and ready['version'] != self.job.data.get('source_version'):
+            return None
+        if checkpoint and (not self.job.data['completed'] or
+                           self.job.data['completed'][-1]['id'] != checkpoint or
+                           self.job.data['completed'][-1]['version'] != ready['version']):
+            return None
         return attempt
+
+    def _filestore_fingerprint(self):
+        files = inventory(self.filestore_dir)
+        return hashlib.sha256(json.dumps(files, sort_keys=True).encode()).hexdigest()
+
+    def _mark_workspace_ready(self, version, filestore_fingerprint=None):
+        info = self._inspect_owned(self.db_container, self.attempt['id'])
+        if not info or not info['State']['Running']:
+            raise RecoveryError('WORKSPACE_INVALID: working PostgreSQL container is not running')
+        self.attempt['workspace_ready'] = {
+            'version': version, 'db_container_id': info['Id'],
+            'filestore_sha256': filestore_fingerprint or self._filestore_fingerprint(),
+            'modules': self.module_baseline, 'runtime': self.current_runtime}
+        self.attempt['migration_started'] = False
+        self.job.save()
+
+    def _reuse_workspace(self):
+        ready = self.attempt['workspace_ready']
+        info = self._inspect_owned(self.db_container, self.attempt['id'])
+        if not info or info['Id'] != ready['db_container_id']:
+            raise RecoveryError('WORKSPACE_INVALID: working PostgreSQL container changed or disappeared')
+        network = self._run_cmd(['docker', 'network', 'inspect', self.network], capture_output=True)
+        attached = json.loads(network.stdout)[0].get('Containers') or {}
+        if any(container_id != info['Id'] for container_id in attached):
+            raise RecoveryError('WORKSPACE_INVALID: unexpected container is attached to the private network')
+        for name in self.attempt['containers']:
+            if name != self.db_container and self._inspect_owned(name, self.attempt['id']):
+                raise RecoveryError('WORKSPACE_INVALID: migration container exists; restore a checkpoint')
+        if self._filestore_fingerprint() != ready['filestore_sha256']:
+            raise RecoveryError('WORKSPACE_INVALID: filestore changed; restore a checkpoint')
+        self._run_cmd(['docker', 'start', self.db_container], capture_output=True)
+        self.wait_for_db()
+        self._database_restored = True
+        self.pg_runtime = self.attempt.get('postgres_runtime')
+        self.module_baseline = ready['modules']
+        validation = self._technical(ready['version'], self.filestore_dir)
+        if validation['modules'] != ready['modules']:
+            raise RecoveryError('WORKSPACE_INVALID: installed modules changed; restore a checkpoint')
+        self.current_runtime = ready['runtime']
+        return ready['version']
 
     def prepare_environment(self):
         for directory in (self.source_dir, self.output_dir, self.filestore_dir, self.custom_addons_dir):
@@ -562,12 +648,23 @@ class RecoveryMixin:
         del candidates[target]
         self.job.save()
 
-    def run_upgrade_step(self, target_version):
-        self._uom_preflight(target_version)
+    def _prepare_migration_image(self, target_version):
+        """Build and probe a pinned image without touching the working database."""
         revision = self.revisions.get(target_version)
         if not revision:
             raise RecoveryError('RUNTIME_REVISION: supply --openupgrade-revision for this older transition')
+        fingerprint = self._runtime_plan()['application_fingerprint']
+        addons_sha256 = self.job.data['config'].get('addons_sha256')
+        cached = self.attempt.setdefault('prebuilt_images', {}).get(target_version)
+        if cached and (cached['revision'] == revision and cached['application_fingerprint'] == fingerprint
+                       and cached['addons_sha256'] == addons_sha256):
+            result = self._run_cmd(['docker', 'image', 'inspect', cached['image_id'], '--format={{.Id}}'],
+                                   check=False, capture_output=True)
+            if result.returncode == 0 and result.stdout.strip() == cached['image_id']:
+                return cached
         build = Path(self.cwd) / 'build' / target_version
+        if build.exists():
+            shutil.rmtree(build)
         build.mkdir(parents=True)
         custom = ''
         if self.extra_addons:
@@ -586,8 +683,6 @@ USER odoo
         (build / 'Dockerfile').write_text(recipe)
         name = 'ou-migrate-' + self.attempt['id'].replace('-', '') + '-' + target_version.replace('.', '-')
         image = name + ':local'
-        self.attempt['containers'].append(name)
-        self.job.save()
         self.job.stage('BUILDING_' + target_version)
         self._run_cmd(['docker', 'build', '-t', image, str(build)], capture_output=True)
         image_id = self._run_cmd(['docker', 'image', 'inspect', image, '--format={{.Id}}'], capture_output=True).stdout.strip()
@@ -595,15 +690,32 @@ USER odoo
         if target_version == '18.0':
             probe += "assert callable(openupgrade.add_inherits_parent_xmlids); "
         probe += f"assert json.loads(m.distribution('openupgradelib').read_text('direct_url.json'))['vcs_info']['commit_id'] == '{LIBRARY_REVISION}'; "
-        probe += "print(json.dumps({'python':__import__('platform').python_version(),'dependencies':sorted((d.metadata['Name'],d.version) for d in m.distributions()),'library':json.loads(m.distribution('openupgradelib').read_text('direct_url.json')).get('vcs_info')}))"
+        probe += ("packages=[(d.metadata.get('Name') or '<unnamed>', d.metadata.get('Version') or '<unknown-version>') for d in m.distributions()]; "
+                  "print(json.dumps({'python':__import__('platform').python_version(),'dependencies':sorted(packages),"
+                  "'incomplete_distribution_count':sum(name == '<unnamed>' or version == '<unknown-version>' for name,version in packages),"
+                  "'library':json.loads(m.distribution('openupgradelib').read_text('direct_url.json')).get('vcs_info')}))")
         env = json.loads(self._run_cmd(['docker', 'run', '--rm', '--network', 'none', '--entrypoint', 'python3', image_id, '-c', probe], capture_output=True).stdout)
-        self.current_runtime = {'openupgrade': revision, 'openupgradelib': LIBRARY_REVISION,
+        if env['incomplete_distribution_count']:
+            logger.warning('%s Python distributions lack Name/Version metadata; placeholders recorded in runtime inventory',
+                           env['incomplete_distribution_count'])
+        self._run_cmd(['docker', 'run', '--rm', '--network', 'none', '--entrypoint', 'python3', image_id, '-m', 'pip', 'check'], capture_output=True)
+        prepared = {'revision': revision, 'image_id': image_id, 'environment': env,
+                    'application_fingerprint': fingerprint, 'addons_sha256': addons_sha256}
+        self.attempt['prebuilt_images'][target_version] = prepared
+        self.job.save()
+        return prepared
+
+    def run_upgrade_step(self, target_version):
+        self._uom_preflight(target_version)
+        prepared = self._prepare_migration_image(target_version)
+        image_id = prepared['image_id']
+        name = 'ou-migrate-' + self.attempt['id'].replace('-', '') + '-' + target_version.replace('.', '-')
+        self.current_runtime = {'openupgrade': prepared['revision'], 'openupgradelib': LIBRARY_REVISION,
             'image_id': image_id, 'odoo_revision': None, 'odoo_revision_note': 'Official image has no verified Git provenance',
-            'application_fingerprint': self._runtime_plan()['application_fingerprint'],
-            'postgres': self._sql('SHOW server_version'), 'environment': env}
+            'application_fingerprint': prepared['application_fingerprint'],
+            'postgres': self._sql('SHOW server_version'), 'environment': prepared['environment']}
         self.current_runtime['addons_sha256'] = self.job.data['config'].get('addons_sha256')
         self.current_runtime['application_commit'] = self._runtime_plan()['application_commit']
-        self._run_cmd(['docker', 'run', '--rm', '--network', 'none', '--entrypoint', 'python3', image_id, '-m', 'pip', 'check'], capture_output=True)
         self.attempt['runtime'][target_version] = self.current_runtime
         self.job.save()
         if target_version == '19.0' and self.uom_rows is not None:
@@ -615,6 +727,12 @@ USER odoo
             self.job.save()
         self._runtime_guard(target_version, self.current_runtime)
         self.job.stage('MIGRATING_' + target_version)
+        if name not in self.attempt['containers']:
+            self.attempt['containers'].append(name)
+        # Persist the write boundary before Docker can start Odoo. Any failure
+        # after this point must restore a checkpoint, never reuse this database.
+        self.attempt['migration_started'] = True
+        self.job.save()
         command = ['docker', 'run', '--name', name, '--label', 'odooupgrader.job=' + self.job.id,
             '--label', 'odooupgrader.attempt=' + self.attempt['id'], '--network', self.network,
             '--user', f'{os.getuid()}:{os.getgid()}', '--env', 'HOME=/tmp',
@@ -674,6 +792,7 @@ USER odoo
     def _write_compact_checkpoint_zip(self, destination, version, validation):
         """Stream the working DB and filestore to one immutable checkpoint ZIP."""
         files = inventory(self.filestore_dir)  # Reject links and special files before archiving.
+        self._last_filestore_fingerprint = hashlib.sha256(json.dumps(files, sort_keys=True).encode()).hexdigest()
         def copy_with_reserve(source, target):
             while block := source.read(1024 * 1024):
                 require_space(self.cwd, len(block))
@@ -735,9 +854,14 @@ USER odoo
             raise RecoveryError('CHECKPOINT_INVALID: final ZIP does not match the target version')
         source = checkpoint / 'checkpoint.zip'
         destination = Path(self.output_dir) / 'upgraded.zip'
-        os.link(source, destination)
+        if destination.exists():
+            if (destination.is_symlink() or destination.stat().st_ino != source.stat().st_ino
+                    or destination.stat().st_dev != source.stat().st_dev):
+                raise RecoveryError('ARTIFACT_INVALID: existing output is not the completed checkpoint')
+        else:
+            os.link(source, destination)
         sync_dir(destination.parent)
-        self.job.data['artifact'] = {'path': str(destination), 'sha256': digest(destination),
+        self.job.data['artifact'] = {'path': str(destination), 'sha256': manifest['files']['checkpoint.zip']['sha256'],
                                      'independent_restore_verified': False}
         return destination
 
@@ -772,7 +896,7 @@ USER odoo
             self.job = Job.create(self.jobs_dir, self.target_version, self.postgres_version,
                 {'runtime_plan': self._runtime_plan(), 'extra_addons': bool(self.extra_addons),
                  'allow_missing_attachments': self.allow_missing_attachments,
-                 'single_copy': self.single_copy})
+                 'single_copy': self.single_copy, 'source_version': self.source_version_hint})
         console.print('Job ID: ' + self.job.id)
         if self.single_copy:
             console.print('Storage mode: one working database/filestore; ZIP checkpoint after each successful version')
@@ -780,78 +904,113 @@ USER odoo
             if self.job.data['state'] == 'COMPLETED':
                 return self.job.data['artifact']['path']
             previous_attempts = list(self.job.data['attempts'])
-            self.attempt = self._new_attempt()
+            reusable = self._reusable_workspace(allow_interrupted_running=True) if resume else None
+            if resume and not reusable and not self.job.data['latest_checkpoint']:
+                raise RecoveryError('NO_CHECKPOINT: no verified checkpoint or reusable pre-migration workspace')
+            if reusable:
+                self.attempt = reusable
+                previous_attempts.pop()
+                self.attempt['outcome'] = 'RUNNING'
+                self.attempt['ended'] = None
+                self.attempt['reuse_count'] = self.attempt.get('reuse_count', 0) + 1
+                self.job.data.update(state='RUNNING', stage='PREPARING', artifact=None)
+                self.job.save()
+                self._set_attempt_paths(self.attempt)
+            else:
+                self.attempt = self._new_attempt()
             self.attempt['runtime']['plan'] = self._runtime_plan()
             try:
-                snapshot = self.job.checkpoint() if resume else None
+                snapshot = self.job.checkpoint() if resume and self.job.data['latest_checkpoint'] else None
                 self._plan_change(commit=True)
                 self.assert_local_docker()
                 for previous in previous_attempts:
                     self._stop_attempt(previous)
                 self.prepare_environment()
-                if self.single_copy and snapshot and snapshot[1]['version'] == self.target_version:
-                    artifact = self.finalize_single_copy_package(self.target_version)
-                    self.attempt.update(outcome='SUCCEEDED', ended=time.time())
-                    self.job.data.update(state='COMPLETED', stage='COMPLETED')
-                    self.job.save()
-                    console.print('Upgrade complete: ' + str(artifact))
-                    console.print('Independent restore verification was not run for this ZIP checkpoint.')
-                    return str(artifact)
-                self.job.stage('INPUT_PREPARATION')
-                if resume:
+                if reusable:
+                    self._stop_attempt(self.attempt)
                     addon = self.job.path / 'inputs' / 'custom_addons'
-                    self.extra_addons = str(addon) if addon.exists() else None
-                    if addon.exists():
-                        current_hash = hashlib.sha256(json.dumps(inventory(addon), sort_keys=True).encode()).hexdigest()
-                        if current_hash != self.job.data['config'].get('addons_sha256'):
-                            raise RecoveryError('ADDONS_CHANGED: retained source bundle is corrupt or modified')
+                    if self.job.data['config'].get('extra_addons'):
+                        if not addon.is_dir():
+                            raise RecoveryError('ADDONS_CHANGED: retained custom addons missing')
+                        saved_addons = inventory(addon)
+                        saved_hash = hashlib.sha256(json.dumps(saved_addons, sort_keys=True).encode()).hexdigest()
+                        if (saved_addons != inventory(self.custom_addons_dir) or
+                                saved_hash != self.job.data['config'].get('addons_sha256')):
+                            raise RecoveryError('ADDONS_CHANGED: retained custom addons changed')
+                        self.extra_addons = str(addon)
+                    current = self._reuse_workspace()
                 else:
-                    self.validate_source_accessibility()
-                self.process_extra_addons()
-                if not resume and self.extra_addons:
-                    shutil.copytree(self.custom_addons_dir, self.job.path / 'inputs' / 'custom_addons')
-                    self.job.data['config']['addons_sha256'] = hashlib.sha256(json.dumps(inventory(self.custom_addons_dir), sort_keys=True).encode()).hexdigest()
-                    self.job.save()
-                self._prepare_restore_input(snapshot)
-                self.create_db_compose_file()
-                self._run_cmd(self.compose_cmd + ['-f', 'db-composer.yml', 'up', '-d'], capture_output=True)
-                self.wait_for_db()
-                self.job.stage('RESTORING')
-                if snapshot:
-                    directory, manifest = snapshot
-                    self.module_baseline = manifest['validation']['modules']
-                    if manifest.get('checkpoint_format') == 'zip':
-                        self.restore_database('ZIP')
+                    if self.single_copy and snapshot and snapshot[1]['version'] == self.target_version:
+                        artifact = self.finalize_single_copy_package(self.target_version)
+                        self.attempt.update(outcome='SUCCEEDED', ended=time.time())
+                        self.job.data.update(state='COMPLETED', stage='COMPLETED')
+                        self.job.save()
+                        console.print('Upgrade complete: ' + str(artifact))
+                        console.print('Independent restore verification was not run for this ZIP checkpoint.')
+                        return str(artifact)
+                    self.job.stage('INPUT_PREPARATION')
+                    if resume:
+                        addon = self.job.path / 'inputs' / 'custom_addons'
+                        self.extra_addons = str(addon) if addon.exists() else None
+                        if addon.exists():
+                            current_hash = hashlib.sha256(json.dumps(inventory(addon), sort_keys=True).encode()).hexdigest()
+                            if current_hash != self.job.data['config'].get('addons_sha256'):
+                                raise RecoveryError('ADDONS_CHANGED: retained source bundle is corrupt or modified')
                     else:
-                        self._restore_dump(directory / 'database.dump', 'database')
-                        shutil.copytree(directory / 'filestore', self.filestore_dir, dirs_exist_ok=True)
-                    current = manifest['version']
-                    self._technical(current, self.filestore_dir)
-                    if manifest.get('checkpoint_format') == 'zip':
-                        self._probe('database', self.filestore_dir, manifest['runtime']['image_id'])
+                        self.validate_source_accessibility()
+                    self.process_extra_addons()
+                    if not resume and self.extra_addons:
+                        shutil.copytree(self.custom_addons_dir, self.job.path / 'inputs' / 'custom_addons')
+                        self.job.data['config']['addons_sha256'] = hashlib.sha256(json.dumps(inventory(self.custom_addons_dir), sort_keys=True).encode()).hexdigest()
+                        self.job.save()
+                    preflight_version = snapshot[1]['version'] if snapshot else self.source_version_hint
+                    source_image_id = self._normal_image(preflight_version) if preflight_version and not snapshot else None
+                    if preflight_version and int(preflight_version.split('.')[0]) < int(self.target_version.split('.')[0]):
+                        self._prepare_migration_image(self.generate_next_version(preflight_version))
+                    self._prepare_restore_input(snapshot)
+                    self.create_db_compose_file()
+                    self._run_cmd(self.compose_cmd + ['-f', 'db-composer.yml', 'up', '-d'], capture_output=True)
+                    self.wait_for_db()
+                    self.job.stage('RESTORING')
+                    if snapshot:
+                        directory, manifest = snapshot
+                        self.module_baseline = manifest['validation']['modules']
+                        if manifest.get('checkpoint_format') == 'zip':
+                            self.restore_database('ZIP')
+                        else:
+                            self._restore_dump(directory / 'database.dump', 'database')
+                            shutil.copytree(directory / 'filestore', self.filestore_dir, dirs_exist_ok=True)
+                        current = manifest['version']
+                        self._technical(current, self.filestore_dir)
+                        if manifest.get('checkpoint_format') == 'zip':
+                            self._probe('database', self.filestore_dir, manifest['runtime']['image_id'])
+                        else:
+                            # Verify normal startup only on a disposable snapshot copy, never on
+                            # the actual attempt DB that the next migration will consume.
+                            self._verify_copy(directory / 'database.dump', directory / 'filestore', current, manifest['runtime'])
+                        self.current_runtime = manifest['runtime']
                     else:
-                        # Verify normal startup only on a disposable snapshot copy, never on
-                        # the actual attempt DB that the next migration will consume.
-                        self._verify_copy(directory / 'database.dump', directory / 'filestore', current, manifest['runtime'])
-                    self.current_runtime = manifest['runtime']
-                else:
-                    self.restore_database(self.restore_file_type)
-                    current = self.get_current_version()
-                    if not re.fullmatch(r'\d+\.\d+(?:\.[\w.-]+)*', current):
-                        raise RecoveryError('SOURCE_VERSION: could not establish installed base version')
-                    current = current.split('.')[0] + '.0'
-                    if current not in self.VALID_VERSIONS:
-                        raise RecoveryError('SOURCE_VERSION: unsupported source major')
-                    if int(current.split('.')[0]) > int(self.target_version.split('.')[0]):
-                        raise RecoveryError('DOWNGRADE: source is newer than requested target')
-                    self.job.data['source_version'] = current
-                    self.module_baseline = self._technical(current, self.filestore_dir)['modules']
-                    self.current_runtime = {'image_id': self._normal_image(current), 'openupgrade': None,
-                        'openupgradelib': None, 'odoo_revision': None,
-                        'application_fingerprint': self._runtime_plan()['application_fingerprint'],
-                        'postgres': self._sql('SHOW server_version')}
-                    if not self.single_copy:
-                        self._checkpoint(current, self.current_runtime)
+                        self.restore_database(self.restore_file_type)
+                        current = self.get_current_version()
+                        if not re.fullmatch(r'\d+\.\d+(?:\.[\w.-]+)*', current):
+                            raise RecoveryError('SOURCE_VERSION: could not establish installed base version')
+                        current = current.split('.')[0] + '.0'
+                        if current not in self.VALID_VERSIONS:
+                            raise RecoveryError('SOURCE_VERSION: unsupported source major')
+                        if int(current.split('.')[0]) > int(self.target_version.split('.')[0]):
+                            raise RecoveryError('DOWNGRADE: source is newer than requested target')
+                        if self.source_version_hint and current != self.source_version_hint:
+                            raise RecoveryError('SOURCE_VERSION: restored source does not match --source-version')
+                        self.job.data['source_version'] = current
+                        self.module_baseline = self._technical(current, self.filestore_dir)['modules']
+                        self.current_runtime = {'image_id': source_image_id or self._normal_image(current), 'openupgrade': None,
+                            'openupgradelib': None, 'odoo_revision': None,
+                            'application_fingerprint': self._runtime_plan()['application_fingerprint'],
+                            'postgres': self._sql('SHOW server_version')}
+                        if not self.single_copy:
+                            self._checkpoint(current, self.current_runtime)
+                    if self.single_copy:
+                        self._mark_workspace_ready(current)
                 while int(current.split('.')[0]) < int(self.target_version.split('.')[0]):
                     target = self.generate_next_version(current)
                     transition = {'source': current, 'target': target, 'outcome': 'RUNNING'}
@@ -866,6 +1025,7 @@ USER odoo
                     if self.single_copy:
                         validation = self._single_copy_checkpoint(target)
                         self.module_baseline = validation['modules']
+                        self._mark_workspace_ready(target, self._last_filestore_fingerprint)
                     else:
                         self._checkpoint(target, self.current_runtime)
                         self.module_baseline = self.job.checkpoint()[1]['validation']['modules']
@@ -907,8 +1067,9 @@ USER odoo
             finally:
                 try:
                     self._stop_attempt(self.attempt)
-                except Exception:
-                    logger.error('Owned resources could not be stopped; resume must reconcile before restore')
+                except Exception as exc:
+                    logger.error('Owned resources could not be stopped; resume must reconcile before restore (%s: %s)',
+                                 type(exc).__name__, exc)
                 if self._handler:
                     logger.removeHandler(self._handler)
                     self._handler.close()

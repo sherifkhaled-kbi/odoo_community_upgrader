@@ -18,11 +18,21 @@ odooupgrader --source /srv/backups/test-backup.zip --version 19.0 --postgres-ver
 
 `--extra-addons`, `--verbose`, `--log-file` and URL sources remain available. A custom-format dump can supply `--filestore /srv/backups/matching-filestore`. Sources are copied, never deleted. Installed custom modules need compatible sources/dependencies for **every** intermediate version; unsupported missing modules block verification. Official Odoo image Git revisions may be unavailable and are explicitly recorded as unknown; actual image IDs and dependency inventories are recorded.
 
-For a backup with known missing attachment files, add `--allow-missing-attachments` to a **new** upgrade command. The default rejects missing files. This option allows missing files only: unsafe attachment paths and size/checksum mismatches on present files still fail. The missing count is printed and recorded under `validation.attachments` in each checkpoint manifest (also included in the final ZIP). Missing files remain unavailable in the output and in Odoo after restore. The choice is stored with the job and reused on resume. A job that failed before its first checkpoint cannot be resumed; start a new job with the option and the original backup.
+For a backup with known missing attachment files, add `--allow-missing-attachments` to a **new** upgrade command. The default rejects missing files. This option allows missing files only: unsafe attachment paths and size/checksum mismatches on present files still fail. The missing count is printed and recorded under `validation.attachments` in each checkpoint manifest (also included in the final ZIP). Missing files remain unavailable in the output and in Odoo after restore. The choice is stored with the job and reused on resume. A failure before the first checkpoint can resume only if a verified pre-migration working database was retained; otherwise start a new job from the original backup.
 
-For limited storage, add `--single-copy` to a **new** upgrade command. This mode reads a local source backup in place, keeps one working PostgreSQL database and one working filestore, and checks that the source did not change during restore. After each successful version transition, it streams the database and filestore into one immutable checkpoint ZIP; the final ZIP is hard-linked to the final checkpoint without duplicating its bytes. A failed job can resume from its latest completed ZIP checkpoint. No second verification database or filestore is created, and the ZIP records `independent_restore: false` in `odooupgrader-run.json`. A failure before the first successful transition still requires a new job. Previous jobs and stopped Docker volumes are never deleted. This mode still needs enough free space for PostgreSQL/WAL growth, Docker images and each checkpoint ZIP, and it does not repair missing attachments.
+For limited storage, add `--single-copy` to a **new** upgrade command. This mode reads a local source backup in place, keeps one working PostgreSQL database and one working filestore, and checks that the source did not change during restore. After each successful version transition, it streams the database and filestore into one immutable checkpoint ZIP; the final ZIP is hard-linked to the final checkpoint without duplicating its bytes. No second verification database or filestore is created, and the ZIP records `independent_restore: false` in `odooupgrader-run.json`. Previous jobs and stopped Docker volumes are never deleted. This mode still needs enough free space for PostgreSQL/WAL growth, Docker images and each checkpoint ZIP, and it does not repair missing attachments.
+
+For a known source major, add `--source-version 17.0` (adjust the version) to build and probe the first OpenUpgrade image **before** extracting or restoring the backup. The restored database version must match. Without this option, the first image is prepared after restore. In single-copy mode, a failure after restore but before Odoo starts can now resume on the same stopped working database and filestore after checking container identity, filestore hashes and technical state. The write boundary is persisted before Odoo starts. A failure after that boundary restores the last successful ZIP checkpoint; if no transition has succeeded yet, a new job from the original backup is still required. An old job created before this feature has no reusable-workspace marker and follows its existing checkpoint rules.
+
+```bash
+odooupgrader --source /opt/odoo17_backup.zip --source-version 17.0 --version 19.0 \
+  --postgres-version auto --jobs-dir /opt/odooupgrader-jobs \
+  --allow-missing-attachments --single-copy
+```
 
 Migration-image builds trust only the exact `/mnt/extra-addons` Git directory for the OpenUpgrade fetch. This handles Odoo base images where that pre-existing directory is owned by the `odoo` user while the build runs as root; no system-wide Git safe-directory setting is changed.
+
+The migration-image probe records installed Python distributions even when a package has incomplete `Name` or `Version` metadata. Such entries get explicit placeholders and a count in the runtime inventory; the pinned `openupgradelib` commit check still must pass.
 
 **PostgreSQL restore compatibility:** use `--postgres-version auto` to inspect the source-server and pg_dump versions before choosing a supported 13–17 image. An explicit older version is rejected before restore; the original dump is never rewritten. Actual server/client versions and image identity are verified. Unknown headers or newer unsupported formats block with actionable diagnostics. See the [restore compatibility correction](docs/implementation/RESTORE_COMPATIBILITY_FIX.md).
 
@@ -33,12 +43,13 @@ Each run prints a UUID. State defaults to `.odooupgrader/jobs` in the invocation
 ```bash
 odooupgrader --jobs-dir /srv/odoo-upgrade-jobs jobs
 odooupgrader --jobs-dir /srv/odoo-upgrade-jobs status JOB_UUID
+odooupgrader --jobs-dir /srv/odoo-upgrade-jobs storage JOB_UUID
 odooupgrader --jobs-dir /srv/odoo-upgrade-jobs resume JOB_UUID --dry-run
 odooupgrader --jobs-dir /srv/odoo-upgrade-jobs resume JOB_UUID
 odooupgrader --jobs-dir /srv/odoo-upgrade-jobs diagnostics JOB_UUID --output ./failure-review.zip
 ```
 
-A failed 18→19 transition resumes from the verified 18 checkpoint in a **fresh** database/filestore. Completed 16→17 and 17→18 transitions are retained. Missing/corrupt checkpoints block; there is no silent fallback. Closing or losing the terminal may interrupt execution; use an external terminal multiplexer if desired:
+A failed 18→19 transition resumes from the verified 18 checkpoint in a **fresh** database/filestore. A pre-migration failure can reuse the same verified working database instead. Completed 16→17 and 17→18 transitions are retained. Missing/corrupt checkpoints block; there is no silent fallback. `storage` reports allocated job/checkpoint/attempt bytes, accessible job-owned PostgreSQL volume and WAL bytes, and known Docker image virtual sizes. Image sizes include shared layers and must not be added as exact physical usage. Closing or losing the terminal may interrupt execution; use an external terminal multiplexer if desired:
 
 ```bash
 tmux new -s odoo-upgrade

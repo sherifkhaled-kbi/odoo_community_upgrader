@@ -3,12 +3,13 @@ import json
 import logging
 from pathlib import Path
 import shutil
+import subprocess
 import click
 from rich.logging import RichHandler
 
 from .core import OdooUpgrader
 from .diagnostics import RedactionFilter
-from .jobs import Job, RecoveryError
+from .jobs import Job, RecoveryError, allocated_bytes
 
 logging.basicConfig(level=logging.INFO, format='%(message)s',
                     handlers=[RichHandler(rich_tracebacks=False, show_level=False, show_path=False)])
@@ -48,10 +49,12 @@ def execute(upgrader):
               help='Continue when database attachments reference missing filestore files; still verify files that exist')
 @click.option('--single-copy', is_flag=True,
               help='Use one working database and filestore with ZIP checkpoints; no independent restore verification')
+@click.option('--source-version', type=click.Choice(OdooUpgrader.VALID_VERSIONS),
+              help='Known source major version; prebuild the first migration image before restoring the backup')
 @click.option('--openupgrade-revision', multiple=True, metavar='VERSION=SHA', help='Exact reviewed OpenUpgrade revision for a transition')
 @click.pass_context
 def main(ctx, source, version, extra_addons, verbose, postgres_version, log_file, jobs_dir, filestore,
-         allow_missing_attachments, single_copy, openupgrade_revision):
+         allow_missing_attachments, single_copy, source_version, openupgrade_revision):
     """Upgrade Odoo locally using Docker; retain verified recovery checkpoints."""
     logger = logging.getLogger('odooupgrader')
     logger.setLevel(logging.DEBUG if verbose else logging.INFO)
@@ -64,7 +67,7 @@ def main(ctx, source, version, extra_addons, verbose, postgres_version, log_file
         ctx.call_on_close(lambda: (logger.removeHandler(handler), handler.close()))
     ctx.obj = {'jobs_dir': jobs_dir.resolve(), 'verbose': verbose, 'revisions': revisions(openupgrade_revision)}
     if ctx.invoked_subcommand is not None:
-        if source or version or extra_addons or filestore or allow_missing_attachments or single_copy:
+        if source or version or extra_addons or filestore or allow_missing_attachments or single_copy or source_version:
             raise click.UsageError('Source/version/addons/filestore/attachment/storage options apply only to a new upgrade')
         return
     if not source or not version:
@@ -72,7 +75,8 @@ def main(ctx, source, version, extra_addons, verbose, postgres_version, log_file
     try:
         upgrader = OdooUpgrader(source, version, extra_addons, verbose, postgres_version,
                                jobs_dir=jobs_dir, revisions=ctx.obj['revisions'], filestore=filestore,
-                               allow_missing_attachments=allow_missing_attachments, single_copy=single_copy)
+                               allow_missing_attachments=allow_missing_attachments, single_copy=single_copy,
+                               source_version=source_version)
         execute(upgrader)
     except RecoveryError as exc:
         raise click.ClickException(str(exc)) from exc
@@ -105,6 +109,73 @@ def status(options, job_id):
         raise click.ClickException(str(exc)) from exc
 
 
+@main.command('storage')
+@click.argument('job_id')
+@click.pass_obj
+def storage(options, job_id):
+    """Measure job files and accessible owned Docker volumes without changing them."""
+    try:
+        job = Job(options['jobs_dir'], job_id)
+        sections = {}
+        seen = set()
+        for name in ('checkpoints', 'inputs', 'attempts', 'diagnostics'):
+            sections[name] = allocated_bytes(job.path / name, seen)
+        sections['metadata'] = sum(allocated_bytes(path, seen) for path in job.path.iterdir() if path.is_file())
+        free = shutil.disk_usage(job.path).free
+        volumes = []
+        try:
+            listed = subprocess.run(['docker', 'volume', 'ls', '--quiet', '--filter', 'label=odooupgrader.job=' + job.id],
+                                    capture_output=True, text=True, timeout=15)
+        except (OSError, subprocess.SubprocessError):
+            listed = None
+        if listed and listed.returncode == 0:
+            for name in listed.stdout.splitlines():
+                try:
+                    inspected = subprocess.run(['docker', 'volume', 'inspect', name],
+                                               capture_output=True, text=True, timeout=15)
+                except (OSError, subprocess.SubprocessError):
+                    inspected = None
+                if not inspected or inspected.returncode:
+                    volumes.append({'name': name, 'allocated_bytes': None})
+                    continue
+                info = json.loads(inspected.stdout)[0]
+                if (info.get('Labels') or {}).get('odooupgrader.job') != job.id:
+                    continue
+                mount = Path(info['Mountpoint'])
+                try:
+                    volumes.append({'name': name, 'allocated_bytes': allocated_bytes(mount),
+                                    'pg_wal_bytes': allocated_bytes(mount / 'pg_wal')})
+                except OSError:
+                    volumes.append({'name': name, 'allocated_bytes': None})
+        image_ids = set()
+        for runtime in job.data.get('runtime_locks', {}).values():
+            if runtime.get('image_id'):
+                image_ids.add(runtime['image_id'])
+        for attempt in job.data['attempts']:
+            for prepared in attempt.get('prebuilt_images', {}).values():
+                if prepared.get('image_id'):
+                    image_ids.add(prepared['image_id'])
+            ready = attempt.get('workspace_ready') or {}
+            if ready.get('runtime', {}).get('image_id'):
+                image_ids.add(ready['runtime']['image_id'])
+        images = []
+        for image_id in sorted(image_ids):
+            try:
+                inspected = subprocess.run(['docker', 'image', 'inspect', image_id, '--format={{.Size}}'],
+                                           capture_output=True, text=True, timeout=15)
+                size = int(inspected.stdout.strip()) if inspected.returncode == 0 else None
+            except (OSError, subprocess.SubprocessError, ValueError):
+                size = None
+            images.append({'image_id': image_id, 'virtual_size_bytes': size})
+        click.echo(json.dumps({'job_id': job.id, 'filesystem_free_bytes': free,
+                               'job_sections_allocated_bytes': sections,
+                               'job_total_allocated_bytes': sum(sections.values()),
+                               'docker_volumes': volumes, 'docker_volume_inventory_available': bool(listed and listed.returncode == 0),
+                               'docker_images': images, 'image_sizes_include_shared_layers': True}, indent=2))
+    except (RecoveryError, OSError, subprocess.SubprocessError, ValueError, KeyError) as exc:
+        raise click.ClickException(f'STORAGE_REPORT: {type(exc).__name__}: {exc}') from exc
+
+
 @main.command('resume')
 @click.argument('job_id')
 @click.option('--dry-run', is_flag=True, help='Read/hash only; fresh restore/registry checks are deferred')
@@ -113,7 +184,7 @@ def status(options, job_id):
 @click.option('--reason', help='Required explanation for an accepted pending runtime correction')
 @click.pass_obj
 def resume(options, job_id, dry_run, openupgrade_revision, accept_runtime_change, reason):
-    """Restore the latest verified checkpoint and retry only the pending transition."""
+    """Reuse a verified pre-migration workspace or restore the latest ZIP checkpoint."""
     try:
         job = Job(options['jobs_dir'], job_id)
         overrides = dict(options['revisions'])
