@@ -574,10 +574,11 @@ class RecoveryMixin:
             shutil.copytree(self.custom_addons_dir, build / 'custom_addons')
             custom = ('COPY --chown=odoo:odoo custom_addons /mnt/custom-addons\n'
                       'RUN if pip3 install --help | grep -q -- --break-system-packages; then PIP_BREAK_SYSTEM_PACKAGES=1 pip3 install --no-cache-dir -r /mnt/custom-addons/requirements.txt; else pip3 install --no-cache-dir -r /mnt/custom-addons/requirements.txt; fi\n')
+        safe_git = 'git -c safe.directory=/mnt/extra-addons -C /mnt/extra-addons'
         recipe = f'''FROM odoo:{target_version}
 USER root
 RUN apt-get update && apt-get install -y git && rm -rf /var/lib/apt/lists/*
-RUN git init /mnt/extra-addons && cd /mnt/extra-addons && git remote add origin https://github.com/OCA/OpenUpgrade.git && git fetch --depth 1 origin {revision} && git checkout --detach FETCH_HEAD && test "$(git rev-parse HEAD)" = "{revision}"
+RUN git init /mnt/extra-addons && {safe_git} remote add origin https://github.com/OCA/OpenUpgrade.git && {safe_git} fetch --depth 1 origin {revision} && {safe_git} checkout --detach FETCH_HEAD && test "$({safe_git} rev-parse HEAD)" = "{revision}"
 RUN if pip3 install --help | grep -q -- --break-system-packages; then PIP_BREAK_SYSTEM_PACKAGES=1 pip3 install --no-cache-dir -r /mnt/extra-addons/requirements.txt && PIP_BREAK_SYSTEM_PACKAGES=1 pip3 install --no-deps --force-reinstall "openupgradelib @ git+https://github.com/OCA/openupgradelib.git@{LIBRARY_REVISION}"; else pip3 install --no-cache-dir -r /mnt/extra-addons/requirements.txt && pip3 install --no-deps --force-reinstall "openupgradelib @ git+https://github.com/OCA/openupgradelib.git@{LIBRARY_REVISION}"; fi
 {custom}
 USER odoo
