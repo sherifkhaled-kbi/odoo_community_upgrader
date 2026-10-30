@@ -55,6 +55,24 @@ def test_filestore_hash_and_size(tmp_path):
         verify_attachments(tmp_path, [entry])
 
 
+def test_missing_attachments_can_be_allowed_without_waiving_other_checks(tmp_path):
+    (tmp_path / 'aa').mkdir()
+    present = b'present attachment'
+    (tmp_path / 'aa' / 'present').write_bytes(present)
+    rows = [
+        {'store_fname': 'aa/missing', 'file_size': 1, 'checksum': None},
+        {'store_fname': 'aa/present', 'file_size': len(present), 'checksum': hashlib.sha1(present).hexdigest()},
+    ]
+    result = verify_attachments(tmp_path, rows, allow_missing=True)
+    assert result == {'referenced_files': 2, 'missing_files': 1, 'passed': False, 'missing_allowed': True}
+    rows[1]['checksum'] = hashlib.sha1(b'other').hexdigest()
+    with pytest.raises(RecoveryError, match='FILESTORE_CORRUPT'):
+        verify_attachments(tmp_path, rows, allow_missing=True)
+    rows[1]['store_fname'] = '../outside'
+    with pytest.raises(RecoveryError, match='FILESTORE_UNSAFE'):
+        verify_attachments(tmp_path, rows, allow_missing=True)
+
+
 @pytest.mark.parametrize('filename', ['../bad', '/absolute', 'a/../../bad', 'a\\bad', 'C:/bad'])
 def test_archive_path_safety(tmp_path, filename):
     source = tmp_path / 'input.zip'

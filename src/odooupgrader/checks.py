@@ -53,15 +53,21 @@ def validate_uom(rows, factor_fix=False):
         raise RecoveryError('UOM_UPSTREAM_FACTOR: pinned 19.0 script inverts custom bigger units; select a reviewed corrected runtime before retry')
 
 
-def verify_attachments(root, rows):
+def verify_attachments(root, rows, allow_missing=False):
     root = Path(root).resolve()
+    missing = 0
     for row in rows:
         name = row['store_fname']
         path = root / name
         if PurePosixPath(name).is_absolute() or '..' in PurePosixPath(name).parts or path.is_symlink():
             raise RecoveryError('FILESTORE_UNSAFE: invalid attachment path')
-        if not path.resolve().is_relative_to(root) or not path.is_file():
-            raise RecoveryError('FILESTORE_MISSING: referenced attachment missing')
+        if not path.resolve().is_relative_to(root):
+            raise RecoveryError('FILESTORE_UNSAFE: attachment path escapes filestore')
+        if not path.is_file():
+            if not allow_missing:
+                raise RecoveryError('FILESTORE_MISSING: referenced attachment missing')
+            missing += 1
+            continue
         if row.get('file_size') is not None and path.stat().st_size != row['file_size']:
             raise RecoveryError('FILESTORE_CORRUPT: attachment size mismatch')
         if row.get('checksum'):
@@ -72,7 +78,8 @@ def verify_attachments(root, rows):
                     h.update(block)
             if h.hexdigest() != row['checksum']:
                 raise RecoveryError('FILESTORE_CORRUPT: attachment checksum mismatch')
-    return {'referenced_files': len(rows), 'passed': True}
+    return {'referenced_files': len(rows), 'missing_files': missing,
+            'passed': missing == 0, 'missing_allowed': bool(allow_missing and missing)}
 
 
 def verify_uom_ratios(before, after):

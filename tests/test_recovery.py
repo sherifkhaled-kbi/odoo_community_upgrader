@@ -206,6 +206,17 @@ def test_failed_validation_never_publishes_or_finalizes(tmp_path, source):
     assert not list(first.job.path.rglob('upgraded.zip'))
 
 
+def test_allow_missing_attachments_is_persisted_for_resume(tmp_path, source):
+    first = FixtureUpgrader(str(source), '19.0', jobs_dir=tmp_path / 'jobs',
+                            allow_missing_attachments=True)
+    first.fail_at = '18.0'
+    with pytest.raises(RecoveryError, match='MIGRATION_EXIT'):
+        first.run()
+    assert first.job.data['config']['allow_missing_attachments'] is True
+    resumed = FixtureUpgrader('', '19.0', jobs_dir=tmp_path / 'jobs', job_id=first.job.id)
+    assert resumed.allow_missing_attachments is True
+
+
 def test_interrupted_process_recorded_and_resumed(tmp_path, source):
     first = failed_job(tmp_path, source)
     first.job.data['state'] = 'RUNNING'

@@ -44,9 +44,12 @@ def execute(upgrader):
 @click.option('--log-file', type=click.Path())
 @click.option('--jobs-dir', type=click.Path(path_type=Path), default=Path('.odooupgrader/jobs'), show_default=True)
 @click.option('--filestore', type=click.Path(exists=True, file_okay=False), help='Matching filestore for a custom-format dump')
+@click.option('--allow-missing-attachments', is_flag=True,
+              help='Continue when database attachments reference missing filestore files; still verify files that exist')
 @click.option('--openupgrade-revision', multiple=True, metavar='VERSION=SHA', help='Exact reviewed OpenUpgrade revision for a transition')
 @click.pass_context
-def main(ctx, source, version, extra_addons, verbose, postgres_version, log_file, jobs_dir, filestore, openupgrade_revision):
+def main(ctx, source, version, extra_addons, verbose, postgres_version, log_file, jobs_dir, filestore,
+         allow_missing_attachments, openupgrade_revision):
     """Upgrade Odoo locally using Docker; retain verified recovery checkpoints."""
     logger = logging.getLogger('odooupgrader')
     logger.setLevel(logging.DEBUG if verbose else logging.INFO)
@@ -59,14 +62,15 @@ def main(ctx, source, version, extra_addons, verbose, postgres_version, log_file
         ctx.call_on_close(lambda: (logger.removeHandler(handler), handler.close()))
     ctx.obj = {'jobs_dir': jobs_dir.resolve(), 'verbose': verbose, 'revisions': revisions(openupgrade_revision)}
     if ctx.invoked_subcommand is not None:
-        if source or version or extra_addons or filestore:
-            raise click.UsageError('Source/version/addons/filestore options apply only to a new upgrade')
+        if source or version or extra_addons or filestore or allow_missing_attachments:
+            raise click.UsageError('Source/version/addons/filestore/attachment options apply only to a new upgrade')
         return
     if not source or not version:
         raise click.UsageError('A new upgrade requires --source and --version; use --help for recovery commands')
     try:
         upgrader = OdooUpgrader(source, version, extra_addons, verbose, postgres_version,
-                               jobs_dir=jobs_dir, revisions=ctx.obj['revisions'], filestore=filestore)
+                               jobs_dir=jobs_dir, revisions=ctx.obj['revisions'], filestore=filestore,
+                               allow_missing_attachments=allow_missing_attachments)
         execute(upgrader)
     except RecoveryError as exc:
         raise click.ClickException(str(exc)) from exc

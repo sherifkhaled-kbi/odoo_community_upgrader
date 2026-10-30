@@ -22,7 +22,8 @@ logger = logging.getLogger('odooupgrader')
 
 
 class RecoveryMixin:
-    def _configure_recovery(self, jobs_dir, job_id, revisions, acceptance, reason, filestore):
+    def _configure_recovery(self, jobs_dir, job_id, revisions, acceptance, reason, filestore,
+                            allow_missing_attachments):
         self.jobs_dir = Path(jobs_dir or Path.cwd() / '.odooupgrader' / 'jobs').resolve()
         self.job = Job(self.jobs_dir, job_id) if job_id else None
         if self.job and (self.target_version != self.job.data['target'] or self.postgres_version != self.job.data['postgres']):
@@ -34,6 +35,8 @@ class RecoveryMixin:
                 raise RecoveryError('RUNTIME_REVISION: expected VERSION=full-lowercase-commit-SHA')
         self.acceptance, self.reason = acceptance, reason
         self.input_filestore = filestore
+        self.allow_missing_attachments = (self.job.data['config'].get('allow_missing_attachments', False)
+                                          if self.job else allow_missing_attachments)
         self._handler = None
         self.db_container = None
         self.network = None
@@ -391,7 +394,10 @@ class RecoveryMixin:
         if self._sql('SELECT count(*) FROM pg_constraint WHERE NOT convalidated', database) != '0':
             raise RecoveryError('DATABASE_CONSTRAINT: unvalidated constraints require review')
         rows = self._rows("SELECT store_fname, checksum, file_size FROM ir_attachment WHERE store_fname IS NOT NULL AND store_fname != ''", database)
-        attachment_result = verify_attachments(filestore, rows)
+        attachment_result = verify_attachments(filestore, rows, allow_missing=self.allow_missing_attachments)
+        if attachment_result['missing_files']:
+            logger.warning('%s referenced attachment files are missing; accepted by --allow-missing-attachments. '
+                           'The resulting backup will not contain these files.', attachment_result['missing_files'])
         return {'passed': True, 'version': expected, 'modules': sorted(installed), 'attachments': attachment_result}
 
     def _uom_preflight(self, target):
@@ -650,7 +656,8 @@ USER odoo
         resume = self.job is not None
         if not resume:
             self.job = Job.create(self.jobs_dir, self.target_version, self.postgres_version,
-                {'runtime_plan': self._runtime_plan(), 'extra_addons': bool(self.extra_addons)})
+                {'runtime_plan': self._runtime_plan(), 'extra_addons': bool(self.extra_addons),
+                 'allow_missing_attachments': self.allow_missing_attachments})
         console.print('Job ID: ' + self.job.id)
         with self.job.lock():
             if self.job.data['state'] == 'COMPLETED':

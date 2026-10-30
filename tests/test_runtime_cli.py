@@ -174,6 +174,36 @@ def test_legacy_cli_and_new_queries(tmp_path, monkeypatch):
     assert CliRunner().invoke(main, ['--source', 'backup.zip']).exit_code == 2
 
 
+def test_allow_missing_attachments_cli_is_explicit_and_new_job_only(monkeypatch):
+    seen = []
+    class Fake:
+        def __init__(self, *args, **kwargs):
+            seen.append(kwargs)
+        def run(self):
+            pass
+    monkeypatch.setattr('odooupgrader.cli.OdooUpgrader', Fake)
+    result = CliRunner().invoke(main, ['--source', 'backup.zip', '--version', '19.0',
+                                       '--allow-missing-attachments'])
+    assert result.exit_code == 0, result.output
+    assert seen[0]['allow_missing_attachments'] is True
+    assert CliRunner().invoke(main, ['--allow-missing-attachments', 'jobs']).exit_code == 2
+
+
+def test_technical_validation_records_allowed_missing_files(upgrader):
+    upgrader._rows = lambda query, database='database': (
+        [{'name': 'base', 'state': 'installed', 'latest_version': '19.0.1.0'}]
+        if 'ir_module_module' in query else
+        [{'store_fname': 'aa/missing', 'checksum': None, 'file_size': 1}])
+    upgrader._sql = lambda query, database='database': '0'
+    with pytest.raises(RecoveryError, match='FILESTORE_MISSING'):
+        upgrader._technical('19.0', upgrader.filestore_dir)
+    upgrader.allow_missing_attachments = True
+    result = upgrader._technical('19.0', upgrader.filestore_dir)
+    assert result['passed'] is True
+    assert result['attachments']['missing_files'] == 1
+    assert result['attachments']['passed'] is False
+
+
 def test_cli_unexpected_exception_is_failure_and_redacted(monkeypatch):
     def fail(self):
         raise ValueError('password=secret customer Acme')
