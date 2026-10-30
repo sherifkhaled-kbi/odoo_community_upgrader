@@ -236,6 +236,52 @@ class RecoveryMixin:
             self.attempt['postgres_runtime'] = self.pg_runtime
         return self.pg_runtime
 
+    def _restore_storage_snapshot(self):
+        """Read numeric capacity only, without SQL or customer/file contents."""
+        roles = ('postgres_data', 'container_tmp', 'shared_memory')
+        paths = ('/var/lib/postgresql/data', '/tmp', '/dev/shm')
+        try:
+            blocks = self._run_cmd(['docker', 'exec', self.db_container, 'df', '-Pk', *paths],
+                                   capture_output=True, timeout=10).stdout.splitlines()[1:]
+            inodes = self._run_cmd(['docker', 'exec', self.db_container, 'df', '-Pi', *paths],
+                                   capture_output=True, timeout=10).stdout.splitlines()[1:]
+            if len(blocks) != len(roles) or len(inodes) != len(roles):
+                raise ValueError('Unexpected df output')
+            usage = {'available': True}
+            for role, block, inode in zip(roles, blocks, inodes):
+                b, i = block.split(), inode.split()
+                usage[role] = {'total_bytes': int(b[1]) * 1024, 'available_bytes': int(b[3]) * 1024,
+                               'available_inodes': int(i[3]) if i[3].isdigit() else None}
+            return usage
+        except Exception:
+            return {'available': False, 'reason': 'Container capacity measurement unavailable'}
+
+    def _restore_capacity(self, path, sql):
+        usage = self._restore_storage_snapshot()
+        context = self.attempt['restore']
+        context['storage_before_restore'] = usage
+        if not usage['available']:
+            raise RestoreFailure('RESTORE_CAPACITY_UNKNOWN', 'cannot inspect PostgreSQL volume capacity; check Docker access and df availability before retry')
+        size = Path(path).stat().st_size
+        reserve = 256 * 1024 * 1024
+        # Admission estimate, not a guarantee: indexes, WAL, extension data and
+        # compression can require more. Include a copied custom archive when
+        # the container layer and PGDATA share physical backing storage.
+        required = {'postgres_data': 3 * size + (0 if sql else size) + reserve,
+                    'container_tmp': (0 if sql else size) + reserve}
+        context['capacity_estimate'] = {'dump_bytes': size, 'required_free_bytes': required,
+                                        'estimate_only': True, 'sql_streamed': sql}
+        for role, needed in required.items():
+            measurement = usage[role]
+            if measurement['available_inodes'] == 0:
+                context.update(category='RESOURCE_EXHAUSTION', resource_condition='FILESYSTEM_INODES_EXHAUSTED')
+                raise RestoreFailure('RESTORE_STORAGE_EXHAUSTED', 'restore filesystem has no free inodes; expand capacity or perform approved cleanup; no checkpoints are deleted')
+            if measurement['available_bytes'] < needed:
+                context.update(category='RESOURCE_EXHAUSTION', resource_condition='INSUFFICIENT_RESTORE_CAPACITY')
+                raise RestoreFailure('RESTORE_CAPACITY_INSUFFICIENT',
+                    f'{role} has {measurement["available_bytes"] // (1024**2)} MiB free; estimated restore requirement is {needed // (1024**2)} MiB. Expand capacity or perform approved cleanup before retry; inputs/checkpoints are retained')
+        self._save_restore_evidence()
+
     def _restore_dump(self, path, database, sql=False):
         context = {'status': 'PREFLIGHT', 'role': 'working' if database == 'database' else 'verification',
                    'requested_postgres': self.postgres_version, 'selected_postgres': self.pg_selected or self.postgres_version,
@@ -255,21 +301,28 @@ class RecoveryMixin:
             if sql != (metadata['format'] == 'plain_sql'):
                 raise RestoreFailure('DUMP_FORMAT_MISMATCH', 'restore command does not match the inspected dump bytes')
             self._save_restore_evidence()
-            self._run_cmd(['docker', 'cp', str(path), self.db_container + ':/tmp/input.dump'], capture_output=True)
+            self._restore_capacity(path, sql)
             if not sql:
+                self._run_cmd(['docker', 'cp', str(path), self.db_container + ':/tmp/input.dump'], capture_output=True)
                 # Read the archive TOC with the actual selected client before CREATE/restore.
                 self._run_cmd(['docker', 'exec', self.db_container, 'pg_restore', '--list', '/tmp/input.dump'], capture_output=True)
             self._run_cmd(['docker', 'exec', self.db_container, 'createdb', '-U', 'odoo', '-T', 'template0', database], capture_output=True)
-            command = ['docker', 'exec', self.db_container]
+            command = ['docker', 'exec'] + (['-i'] if sql else []) + [self.db_container]
             if sql:
                 command += ['psql', '-X', '--echo-errors', '-v', 'ON_ERROR_STOP=1', '-v', 'VERBOSITY=verbose',
-                            '--single-transaction', '-U', 'odoo', '-d', database, '-f', '/tmp/input.dump']
+                            '--single-transaction', '-U', 'odoo', '-d', database, '-f', '-']
             else:
                 command += ['pg_restore', '--exit-on-error', '--single-transaction', '--no-owner', '--no-privileges',
                             '-U', 'odoo', '-d', database, '/tmp/input.dump']
             context['status'] = 'RESTORING'
             self._save_restore_evidence()
-            self._run_cmd(command, capture_output=True)
+            if sql:
+                # Feed the private immutable SQL copy directly to psql; do not
+                # duplicate a potentially huge dump in Docker's writable layer.
+                with Path(path).open('rb') as source:
+                    self._run_cmd(command, capture_output=True, stdin=source)
+            else:
+                self._run_cmd(command, capture_output=True)
             context['status'] = 'SUCCEEDED'
             if database == 'database':
                 self._database_restored = True
@@ -299,11 +352,16 @@ class RecoveryMixin:
                     context.update(sql_failure_evidence(path, stderr))
                 except Exception:
                     context['relevant_error'] = 'Restore failed; statement evidence unavailable; inspect private log'
+            if context.get('sqlstate') == '53100':
+                context['reason'] = 'RESTORE_STORAGE_EXHAUSTED'
+                context['storage_after_failure'] = self._restore_storage_snapshot()
             if isinstance(exc, subprocess.CalledProcessError):
                 context['process_exit_code'] = exc.returncode
             self._save_restore_evidence()
             if isinstance(exc, RestoreFailure):
                 raise
+            if context.get('sqlstate') == '53100':
+                raise RestoreFailure('RESTORE_STORAGE_EXHAUSTED', context['relevant_error'] + '. ' + context.get('recommended_action', 'Inspect storage capacity before starting a new restore'), context) from exc
             raise RestoreFailure('RESTORE_COMMAND_FAILED',
                 'database restoration failed before migration; inspect restore_diagnostics.json and protected restore.private.log', context) from exc
 

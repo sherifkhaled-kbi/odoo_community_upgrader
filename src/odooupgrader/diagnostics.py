@@ -91,7 +91,14 @@ def collect(job, exc, evidence=None):
                        postgres_runtime=restore.get('runtime'),
                        failing_statement=restore.get('failing_statement'), incompatible_statement=restore.get('incompatible_statement'),
                        relevant_error=restore.get('relevant_error'),
-                       sqlstate=restore.get('sqlstate'), process_exit_code=restore.get('process_exit_code'))
+                       sqlstate=restore.get('sqlstate'), process_exit_code=restore.get('process_exit_code'),
+                       category=restore.get('category'), resource_condition=restore.get('resource_condition'),
+                       recommended_action=restore.get('recommended_action'),
+                       storage_before_restore=restore.get('storage_before_restore'),
+                       storage_after_failure=restore.get('storage_after_failure'))
+        if restore.get('category') == 'RESOURCE_EXHAUSTION':
+            summary['message'] = restore.get('relevant_error') or 'Restore capacity check failed; inspect storage evidence'
+            summary['root_cause'] = restore.get('relevant_error') or 'Insufficient measured restore filesystem capacity'
     summary['failing_module'] = None
     docker_log = Path(attempt['work']) / 'docker.log'
     if code != 'DATABASE_RESTORE_FAILURE' and docker_log.is_file():

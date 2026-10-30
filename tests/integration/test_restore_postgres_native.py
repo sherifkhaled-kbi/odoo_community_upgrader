@@ -41,8 +41,8 @@ def native_pg(request):
         run('pg_ctl', ['-D', str(data), '-l', str(root / 'postgres.log'), '-o',
                       f"-c listen_addresses='' -k {socket} -p 55432 -c unix_socket_permissions=0700", '-w', 'start'])
         started = True
-        def client(program, args):
-            return run(program, ['-h', str(socket), '-p', '55432', '-U', 'odoo', *args])
+        def client(program, args, **kwargs):
+            return run(program, ['-h', str(socket), '-p', '55432', '-U', 'odoo', *args], **kwargs)
         yield {'client': client, 'binary': binary, 'run': run, 'root': root}
     finally:
         if started:
@@ -69,11 +69,20 @@ def native_upgrader(native_pg, tmp_path, monkeypatch):
         if cmd[:2] == ['docker', 'cp']:
             u._native_input = cmd[2]
             return None
-        assert cmd[:3] == ['docker', 'exec', u.db_container]
-        program = cmd[3]
-        args = [u._native_input if x == '/tmp/input.dump' else x for x in cmd[4:]]
-        return native_pg['client'](program, args)
+        assert cmd[:2] == ['docker', 'exec']
+        index = cmd.index(u.db_container) + 1
+        program = cmd[index]
+        args = [u._native_input if x == '/tmp/input.dump' else x for x in cmd[index + 1:]]
+        return native_pg['client'](program, args, stdin=kwargs.get('stdin'))
     u._run_cmd = command
+    def storage():
+        result = {'available': True}
+        for role, path in [('postgres_data', native_pg['root']), ('container_tmp', native_pg['root']), ('shared_memory', Path('/dev/shm'))]:
+            info = os.statvfs(path)
+            result[role] = {'available_bytes': info.f_bavail * info.f_frsize,
+                            'total_bytes': info.f_blocks * info.f_frsize, 'available_inodes': info.f_favail}
+        return result
+    u._restore_storage_snapshot = storage
     return u
 
 

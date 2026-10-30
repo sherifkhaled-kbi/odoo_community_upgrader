@@ -61,3 +61,5 @@ Safe local tests:
 ```
 
 Real Docker/database tests are opt-in and require explicit authorization for disposable resources. Local unit/fault tests do not certify actual Odoo migrations or business-data correctness.
+
+For PostgreSQL `53100` / `No space left on device`, see [restore storage exhaustion](docs/implementation/RESTORE_STORAGE_FAILURE.md). Plain SQL is streamed instead of copied into Docker, initial capacity is checked, and storage failures have explicit safe diagnostics. Host disk/volume capacity still needs to be sufficient.

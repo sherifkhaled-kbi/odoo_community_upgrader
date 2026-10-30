@@ -40,7 +40,7 @@ class OdooUpgrader(RecoveryMixin):
         self.compose_cmd = self._get_docker_compose_cmd()
         self._configure_recovery(jobs_dir, job_id, revisions, acceptance, reason, filestore)
 
-    def _run_cmd(self, cmd: List[str], check: bool = True, capture_output: bool = False, timeout=None) -> subprocess.CompletedProcess:
+    def _run_cmd(self, cmd: List[str], check: bool = True, capture_output: bool = False, timeout=None, stdin=None) -> subprocess.CompletedProcess:
         """Executes a subprocess command and logs it."""
         cmd_str = redact(" ".join(cmd))
         logger.debug(f"Executing: {cmd_str}")
@@ -52,7 +52,8 @@ class OdooUpgrader(RecoveryMixin):
                 text=True,
                 capture_output=capture_output,
                 cwd=self.cwd,
-                timeout=timeout
+                timeout=timeout,
+                stdin=stdin
             )
             return result
         except subprocess.CalledProcessError as e:

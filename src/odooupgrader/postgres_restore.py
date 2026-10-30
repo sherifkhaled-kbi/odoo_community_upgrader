@@ -150,7 +150,7 @@ def sql_failure_evidence(path, stderr):
     if isinstance(stderr, bytes):
         stderr = stderr.decode(errors='replace')
     stderr = stderr or ''
-    match = re.search(r'/tmp/input\.dump:(\d+):', stderr)
+    match = re.search(r'(?:/tmp/input\.dump|<stdin>):(\d+):', stderr)
     line_number = int(match[1]) if match else None
     statement = None
     # pg_restore --verbose may report a generated SET not present as plain SQL.
@@ -174,5 +174,25 @@ def sql_failure_evidence(path, stderr):
         error = 'unrecognized configuration parameter "transaction_timeout"'
     else:
         error = 'Restore command failed; raw SQL/error payload retained only in protected restore.private.log'
-    return {'line': line_number, 'failing_statement': statement or '[withheld: inspect private restore log]',
-            'relevant_error': error, 'sqlstate': sqlstate[1] if sqlstate else None}
+    result = {'line': line_number, 'failing_statement': statement or '[withheld: inspect private restore log]',
+              'relevant_error': error, 'sqlstate': sqlstate[1] if sqlstate else None}
+    if result['sqlstate'] == '53100':
+        # Inspect only the primary ERROR/FATAL line, never echoed SQL or COPY rows.
+        primary = re.search(r'(?:ERROR|FATAL):\s+(?:53100:\s*)?([^\r\n]+)', stderr)
+        message = primary[1].lower() if primary else ''
+        condition = 'STORAGE_EXHAUSTED'
+        error = 'PostgreSQL reported disk_full (53100); inspect data-volume capacity, inodes and quotas'
+        action = 'Expand storage or free only explicitly approved files; retain inputs/checkpoints and start a fresh restore'
+        if 'shared memory' in message:
+            condition = 'SHARED_MEMORY_EXHAUSTED'
+            error = 'PostgreSQL could not allocate or resize shared memory (/dev/shm)'
+            action = 'Review the container shared-memory limit and PostgreSQL parallel maintenance settings; do not assume the data disk is full'
+        elif 'quota' in message:
+            condition = 'STORAGE_QUOTA_EXCEEDED'
+            error = 'PostgreSQL storage allocation exceeded a filesystem or container quota'
+        elif 'no space left on device' in message and any(term in message for term in ('extend file', 'write', 'fallocate', 'create file')):
+            condition = 'DATA_FILESYSTEM_EXHAUSTED'
+            error = 'PostgreSQL could not allocate database-file space: No space left on device'
+        result.update(category='RESOURCE_EXHAUSTION', resource_condition=condition,
+                      relevant_error=error, recommended_action=action)
+    return result

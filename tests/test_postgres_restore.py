@@ -45,6 +45,7 @@ def upgrader(tmp_path, monkeypatch):
     u.job = Job.create(u.jobs_dir, '19.0', '17', {'runtime_plan': u._runtime_plan()})
     u.attempt = u._new_attempt()
     u.prepare_environment()
+    u._restore_capacity = lambda *args: None  # Capacity is outside these compatibility/CLI adapter cases.
     u.pg_selected = '17'
     u.pg_runtime = runtime(17)
     u._inspect_owned = lambda *a: None
