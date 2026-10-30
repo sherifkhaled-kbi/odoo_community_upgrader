@@ -167,12 +167,19 @@ class RecoveryMixin:
 
     def wait_for_db(self):
         for _ in range(30):
-            result = self._run_cmd(['docker', 'exec', self.db_container, 'pg_isready', '-U', 'odoo'],
-                                   check=False, capture_output=True)
-            if result.returncode == 0:
-                return
+            # The official image starts a socket-only temporary server during
+            # initialization. Wait for the final TCP server instead.
+            ready = self._run_cmd(['docker', 'exec', self.db_container, 'pg_isready',
+                                   '-h', '127.0.0.1', '-U', 'odoo', '-d', 'postgres'],
+                                  check=False, capture_output=True)
+            if ready.returncode == 0:
+                query = self._run_cmd(['docker', 'exec', self.db_container, 'psql',
+                                       '-X', '-A', '-t', '-U', 'odoo', '-d', 'postgres',
+                                       '-c', 'SELECT 1'], check=False, capture_output=True)
+                if query.returncode == 0 and query.stdout.strip() == '1':
+                    return
             time.sleep(2)
-        raise RecoveryError('POSTGRES_STARTUP: PostgreSQL did not become ready')
+        raise RecoveryError('POSTGRES_STARTUP: final PostgreSQL server did not become ready; inspect this attempt\'s Docker logs')
 
     def _sql(self, query, database='database', timeout=60):
         return self._run_cmd(['docker', 'exec', '-e', 'PGOPTIONS=-c default_transaction_read_only=on',
