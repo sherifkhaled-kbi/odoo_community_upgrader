@@ -42,6 +42,14 @@ class FixtureUpgrader(OdooUpgrader):
             return '13.fixture'
         raise AssertionError(query)
 
+    def _prepare_restore_input(self, snapshot):
+        if snapshot is None:
+            source = self.download_or_copy_source()
+            from odooupgrader.jobs import digest
+            self.job.data['input_sha256'] = digest(source)
+            self.restore_file_type = self.process_source_file(source)
+        self.pg_selected = self.postgres_version
+
     def restore_database(self, file_type):
         self.db = json.loads((Path(self.source_dir) / 'dump.sql').read_text())
         shutil.copytree(Path(self.source_dir) / 'filestore', self.filestore_dir, dirs_exist_ok=True)

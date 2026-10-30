@@ -21,25 +21,44 @@ def upgrader(tmp_path, monkeypatch):
     return u
 
 
-def test_restore_is_fatal_and_fresh(upgrader):
+def test_restore_is_fatal_and_fresh(upgrader, tmp_path):
+    from test_postgres_restore import custom_dump, sql_dump, runtime
+    path = tmp_path / 'input.dump'
+    path.write_bytes(custom_dump('13.19', '13.19', (1, 14, 0)))
+    upgrader.pg_runtime = runtime(13)
     calls = []
     upgrader._run_cmd = lambda command, **kwargs: calls.append((command, kwargs))
-    upgrader._restore_dump('/tmp/dump', 'database')
-    assert 'createdb' in calls[0][0] and 'template0' in calls[0][0]
+    upgrader._restore_dump(path, 'database')
+    create = next(command for command, _ in calls if 'createdb' in command)
+    assert 'template0' in create
+    assert '--list' in calls[1][0]
     assert '--single-transaction' in calls[-1][0]
     assert '--exit-on-error' in calls[-1][0]
     assert all(kw.get('check', True) for _, kw in calls)
     calls.clear()
-    upgrader._restore_dump('/tmp/dump', 'database', sql=True)
+    path.write_text(sql_dump('13.19', '13.19', timeout=False))
+    upgrader._restore_dump(path, 'database', sql=True)
     assert 'ON_ERROR_STOP=1' in calls[-1][0]
     assert '--single-transaction' in calls[-1][0]
 
 
-def test_restore_failure_stops_before_pgrestore(upgrader):
-    upgrader._run_cmd = Mock(side_effect=subprocess.CalledProcessError(1, 'createdb'))
-    with pytest.raises(subprocess.CalledProcessError):
-        upgrader._restore_dump('/tmp/dump', 'database')
-    assert upgrader._run_cmd.call_count == 1
+def test_restore_failure_stops_before_pgrestore(upgrader, tmp_path):
+    from odooupgrader.postgres_restore import RestoreFailure
+    from test_postgres_restore import custom_dump, runtime
+    path = tmp_path / 'input.dump'
+    path.write_bytes(custom_dump('13.19', '13.19', (1, 14, 0)))
+    upgrader.pg_runtime = runtime(13)
+    calls = []
+    def command(cmd, **kwargs):
+        calls.append(cmd)
+        if 'createdb' in cmd:
+            raise subprocess.CalledProcessError(1, cmd)
+    upgrader._run_cmd = command
+    with pytest.raises(RestoreFailure) as error:
+        upgrader._restore_dump(path, 'database')
+    assert isinstance(error.value.__cause__, subprocess.CalledProcessError)
+    assert len(calls) == 3
+    assert not any('pg_restore' in cmd and '--list' not in cmd for cmd in calls)
 
 
 def test_raw_sql_diagnostics_force_read_only(upgrader):

@@ -40,7 +40,7 @@ def execute(upgrader):
 @click.option('--version', type=click.Choice(OdooUpgrader.VALID_VERSIONS), help='Target Odoo version')
 @click.option('--extra-addons', help='Custom addons folder, ZIP or URL')
 @click.option('--verbose', is_flag=True)
-@click.option('--postgres-version', default='13', show_default=True)
+@click.option('--postgres-version', default='13', show_default=True, help='Numeric PostgreSQL version or auto (inspect dump; supported runtimes 13–17)')
 @click.option('--log-file', type=click.Path())
 @click.option('--jobs-dir', type=click.Path(path_type=Path), default=Path('.odooupgrader/jobs'), show_default=True)
 @click.option('--filestore', type=click.Path(exists=True, file_okay=False), help='Matching filestore for a custom-format dump')

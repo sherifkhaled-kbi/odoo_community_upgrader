@@ -21,6 +21,7 @@ Export refuses to overwrite an existing path. Archives/directories are private; 
 - `migration.log`, `docker.log`: structural excerpts (technical module stages, frame locations and exception classes) from the final 2 MiB of each available log. Missing logs are explicit.
 - `openupgrade_revision.json`: planned exact OCA/library/app revisions and actual runtime image ID, dependency inventory and PostgreSQL/Python information where available. Odoo Git SHA is explicitly unknown when the official image cannot establish it.
 - `module_status.json`: read-only technical module name/state/version query, or explicit unavailable status. No models are instantiated.
+- `restore_diagnostics.json`: inspected format/source/producer, requested/selected PG version, actual server/client/image identity, restore phase/reason/exit/SQLSTATE and safe SQL evidence.
 - `database_diagnostics.json`: read-only server-version availability, not customer rows or a DB dump.
 - `docker_status.json`: allowlisted state/exit/OOM/timestamps from owned containers only; never full inspect/environment output.
 - `remediation_history.json`: accepted diff and reason hashes; free-text reasons remain local.
@@ -34,6 +35,6 @@ Technical module/package identifiers and version inventory can still reveal impl
 
 ## Evidence and failure behavior
 
-Database evidence uses read-only PostgreSQL sessions. There is no Odoo registry startup in failure collection. Each SQL/container evidence source can be unavailable without invalidating the original failure; metadata/log packaging still proceeds where possible. Archive completion uses a `.part` file followed by rename; partial ZIPs are not exportable. Kernel/process termination may prevent collection entirely; explicit resume records the interrupted attempt, reconciles resources and creates new evidence if recovery fails.
+A failed restore classifies as `DATABASE_RESTORE_FAILURE` and skips all Odoo-table queries; module diagnostics are explicitly unavailable. Known noncustomer timeout SET statements can be portable; full failed SQL/errors remain only in protected `restore.private.log`. Database evidence uses read-only PostgreSQL sessions. There is no Odoo registry startup in failure collection. Each SQL/container evidence source can be unavailable without invalidating the original failure; metadata/log packaging still proceeds where possible. Archive completion uses a `.part` file followed by rename; partial ZIPs are not exportable. Kernel/process termination may prevent collection entirely; explicit resume records the interrupted attempt, reconciles resources and creates new evidence if recovery fails.
 
 Start investigation with the failed stage, exact runtime revisions and structural trace; reproduce on a disposable copy, verify upstream code/fix, review any pending runtime diff, then use `resume --dry-run`. A valid checkpoint is a recovery boundary, not proof that a cause is safe to ignore. There is no automatic repair or retry for unknown failures.

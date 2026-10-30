@@ -16,6 +16,7 @@ import zipfile
 from .checks import FACTOR_FIX_SCRIPT_SHA256, LIBRARY_REVISION, OPENUPGRADE_REVISIONS, validate_uom, verify_attachments
 from .diagnostics import RedactionFilter, collect
 from .jobs import Job, RecoveryError, atomic_json, digest, inventory, require_space, sync_dir
+from .postgres_restore import (RestoreFailure, inspect_dump, select_runtime, validate_runtime, client_version, version_number, sql_failure_evidence)
 
 logger = logging.getLogger('odooupgrader')
 
@@ -40,6 +41,10 @@ class RecoveryMixin:
         self.module_baseline = []
         self.uom_baseline = None
         self.uom_rows = None
+        self.pg_selected = self.job.data.get('selected_postgres') if self.job else None
+        self.pg_runtime = None
+        self._database_restored = False
+        self._restore_failed = False
 
     def _runtime_plan(self):
         package = Path(__file__).parent
@@ -145,7 +150,7 @@ class RecoveryMixin:
     def create_db_compose_file(self):
         labels = {'odooupgrader.job': self.job.id, 'odooupgrader.attempt': self.attempt['id']}
         compose = {'services': {'db-odooupgrade': {
-            'container_name': self.db_container, 'image': 'postgres:' + self.postgres_version,
+            'container_name': self.db_container, 'image': 'postgres:' + (self.pg_selected or self.postgres_version),
             'labels': labels, 'environment': {'POSTGRES_DB': 'odoo', 'POSTGRES_USER': 'odoo', 'POSTGRES_PASSWORD': 'odoo'},
             'networks': ['migration'], 'volumes': ['postgres_data:/var/lib/postgresql/data'], 'restart': 'no'}},
             'networks': {'migration': {'name': self.network, 'internal': True}},
@@ -172,15 +177,135 @@ class RecoveryMixin:
     def get_current_version(self):
         return self._sql("SELECT latest_version FROM ir_module_module WHERE name='base' AND state='installed'")
 
+    def _save_restore_evidence(self):
+        try:
+            self.job.save()
+        except Exception:
+            logger.error('Restore evidence could not be persisted; original error preserved')
+
+    def _prepare_restore_input(self, snapshot):
+        self.job.stage('RESTORE_PREFLIGHT')
+        context = {'status': 'PREFLIGHT', 'requested_postgres': self.postgres_version,
+                   'role': 'working', 'dump': None, 'runtime': None}
+        self.attempt['restore'] = context
+        try:
+            if snapshot:
+                directory, _ = snapshot
+                path = directory / 'database.dump'
+                self.restore_file_type = 'DUMP'
+            else:
+                source = self.download_or_copy_source()
+                self.job.data['input_sha256'] = digest(source)
+                self.restore_file_type = self.process_source_file(source)
+                path = Path(self.source_dir) / ('dump.sql' if self.restore_file_type == 'ZIP' else 'database.dump')
+            context['input_container'] = 'checkpoint' if snapshot else ('zip' if self.restore_file_type == 'ZIP' else 'file')
+            metadata = inspect_dump(path)
+            context['dump'] = metadata
+            requested = self.pg_selected or self.postgres_version
+            self.pg_selected = select_runtime(requested, metadata)
+            self.job.data['selected_postgres'] = self.pg_selected
+            context.update(selected_postgres=self.pg_selected, status='PREFLIGHT_PASSED')
+            self._save_restore_evidence()
+        except RestoreFailure as exc:
+            self._restore_failed = True
+            if context['dump'] is None:
+                context['dump'] = exc.details.get('dump')
+            context.update(status='FAILED', reason=exc.reason, relevant_error=str(exc), phase_when_failed='PREFLIGHT')
+            if (context.get('dump') or {}).get('required_statement'):
+                context['incompatible_statement'] = context['dump']['required_statement']
+            self._save_restore_evidence()
+            raise
+        except OSError as exc:
+            self._restore_failed = True
+            context.update(status='FAILED', reason='RESTORE_INPUT_UNREADABLE', phase_when_failed='PREFLIGHT')
+            self._save_restore_evidence()
+            raise RestoreFailure('RESTORE_INPUT_UNREADABLE', 'prepared dump cannot be read; check backup format and permissions') from exc
+
+    def _ensure_pg_runtime(self):
+        if self.pg_runtime is None:
+            number = self._sql('SHOW server_version_num', database='postgres', timeout=5)
+            server_version = self._sql('SHOW server_version', database='postgres', timeout=5)
+            psql = self._run_cmd(['docker', 'exec', self.db_container, 'psql', '--version'], capture_output=True, timeout=10).stdout
+            restore = self._run_cmd(['docker', 'exec', self.db_container, 'pg_restore', '--version'], capture_output=True, timeout=10).stdout
+            info = self._inspect_owned(self.db_container, self.attempt['id'])
+            if not info or not number.isdigit() or not version_number(server_version):
+                raise RestoreFailure('RUNTIME_VERSION_UNKNOWN', 'cannot establish actual restore container/server identity')
+            self.pg_runtime = {'server_version_num': int(number), 'server_version': version_number(server_version),
+                'psql_version': client_version(psql), 'pg_restore_version': client_version(restore),
+                'image_id': info['Image'], 'image_reference': info['Config']['Image']}
+            self.attempt['postgres_runtime'] = self.pg_runtime
+        return self.pg_runtime
+
     def _restore_dump(self, path, database, sql=False):
-        self._run_cmd(['docker', 'exec', self.db_container, 'createdb', '-U', 'odoo', '-T', 'template0', database], capture_output=True)
-        self._run_cmd(['docker', 'cp', str(path), self.db_container + ':/tmp/input.dump'], capture_output=True)
-        command = ['docker', 'exec', self.db_container]
-        if sql:
-            command += ['psql', '-X', '-v', 'ON_ERROR_STOP=1', '--single-transaction', '-U', 'odoo', '-d', database, '-f', '/tmp/input.dump']
-        else:
-            command += ['pg_restore', '--exit-on-error', '--single-transaction', '--no-owner', '--no-privileges', '-U', 'odoo', '-d', database, '/tmp/input.dump']
-        self._run_cmd(command, capture_output=True)
+        context = {'status': 'PREFLIGHT', 'role': 'working' if database == 'database' else 'verification',
+                   'requested_postgres': self.postgres_version, 'selected_postgres': self.pg_selected or self.postgres_version,
+                   'dump': None, 'runtime': self.pg_runtime,
+                   'input_container': (self.attempt.get('restore') or {}).get('input_container', 'file') if database == 'database' else 'checkpoint'}
+        self.attempt['restore'] = context
+        self.attempt.setdefault('restore_history', []).append(context)
+        if database == 'database':
+            self._database_restored = False
+        try:
+            metadata = inspect_dump(path)
+            context['dump'] = metadata
+            selected = select_runtime(self.pg_selected or self.postgres_version, metadata)
+            runtime = self._ensure_pg_runtime()
+            context['runtime'] = runtime
+            validate_runtime(metadata, runtime, selected)
+            if sql != (metadata['format'] == 'plain_sql'):
+                raise RestoreFailure('DUMP_FORMAT_MISMATCH', 'restore command does not match the inspected dump bytes')
+            self._save_restore_evidence()
+            self._run_cmd(['docker', 'cp', str(path), self.db_container + ':/tmp/input.dump'], capture_output=True)
+            if not sql:
+                # Read the archive TOC with the actual selected client before CREATE/restore.
+                self._run_cmd(['docker', 'exec', self.db_container, 'pg_restore', '--list', '/tmp/input.dump'], capture_output=True)
+            self._run_cmd(['docker', 'exec', self.db_container, 'createdb', '-U', 'odoo', '-T', 'template0', database], capture_output=True)
+            command = ['docker', 'exec', self.db_container]
+            if sql:
+                command += ['psql', '-X', '--echo-errors', '-v', 'ON_ERROR_STOP=1', '-v', 'VERBOSITY=verbose',
+                            '--single-transaction', '-U', 'odoo', '-d', database, '-f', '/tmp/input.dump']
+            else:
+                command += ['pg_restore', '--exit-on-error', '--single-transaction', '--no-owner', '--no-privileges',
+                            '-U', 'odoo', '-d', database, '/tmp/input.dump']
+            context['status'] = 'RESTORING'
+            self._save_restore_evidence()
+            self._run_cmd(command, capture_output=True)
+            context['status'] = 'SUCCEEDED'
+            if database == 'database':
+                self._database_restored = True
+            self._save_restore_evidence()
+        except (RestoreFailure, OSError, subprocess.SubprocessError, ValueError, KeyError) as exc:
+            self._restore_failed = True
+            context.update(phase_when_failed=context['status'], status='FAILED', reason=exc.reason if isinstance(exc, RestoreFailure) else 'RESTORE_COMMAND_FAILED')
+            if isinstance(exc, RestoreFailure):
+                if context['dump'] is None:
+                    context['dump'] = exc.details.get('dump')
+                context['relevant_error'] = str(exc)
+                if (context.get('dump') or {}).get('required_statement'):
+                    context['incompatible_statement'] = context['dump']['required_statement']
+            stderr = getattr(exc, 'stderr', '') or ''
+            if isinstance(stderr, bytes):
+                stderr = stderr.decode(errors='replace')
+            if stderr:
+                # Protected raw evidence, never inserted into the portable bundle.
+                try:
+                    private = Path(self.cwd) / 'restore.private.log'
+                    with private.open('a') as stream:
+                        os.chmod(private, 0o600)
+                        stream.write(stderr[-2 * 1024 * 1024:] + '\n')
+                except OSError:
+                    logger.error('Private restore log unavailable; original restore error preserved')
+                try:
+                    context.update(sql_failure_evidence(path, stderr))
+                except Exception:
+                    context['relevant_error'] = 'Restore failed; statement evidence unavailable; inspect private log'
+            if isinstance(exc, subprocess.CalledProcessError):
+                context['process_exit_code'] = exc.returncode
+            self._save_restore_evidence()
+            if isinstance(exc, RestoreFailure):
+                raise
+            raise RestoreFailure('RESTORE_COMMAND_FAILED',
+                'database restoration failed before migration; inspect restore_diagnostics.json and protected restore.private.log', context) from exc
 
     def restore_database(self, file_type):
         path = Path(self.source_dir) / ('dump.sql' if file_type == 'ZIP' else 'database.dump')
@@ -191,7 +316,7 @@ class RecoveryMixin:
         elif self.input_filestore:
             inventory(self.input_filestore)
             shutil.copytree(self.input_filestore, self.filestore_dir, dirs_exist_ok=True)
-        self._restore_dump(path, 'database', sql=file_type == 'ZIP')
+        self._restore_dump(path, 'database', sql=(self.attempt.get('restore', {}).get('dump') or {}).get('format') == 'plain_sql')
 
     def _technical(self, expected, filestore, database='database'):
         modules = self._rows('SELECT name, state, latest_version FROM ir_module_module ORDER BY name', database)
@@ -440,12 +565,15 @@ USER odoo
 
     def failure_evidence(self):
         evidence = {}
-        if self.db_container:
+        if self._database_restored and not self._restore_failed:
             try:
                 evidence['module_status'] = self._rows('SELECT name, state, latest_version FROM ir_module_module ORDER BY name', timeout=5)
                 evidence['database_diagnostics'] = {'available': True, 'postgres': self._sql('SHOW server_version', timeout=5)}
             except Exception:
                 evidence['database_diagnostics'] = {'available': False}
+        else:
+            evidence['module_status'] = {'available': False, 'reason': 'DATABASE_RESTORE_FAILURE' if self._restore_failed else 'DATABASE_NOT_RESTORED'}
+            evidence['database_diagnostics'] = {'available': bool(self.pg_runtime), 'postgres_runtime': self.pg_runtime, 'restore': self.attempt.get('restore')}
         states = []
         for name in self.attempt.get('containers', []):
             try:
@@ -459,7 +587,7 @@ USER odoo
 
     def run(self):
         from .core import console
-        if self.target_version not in self.VALID_VERSIONS or not re.fullmatch(r'[0-9]+(?:\.[0-9]+)*', self.postgres_version):
+        if self.target_version not in self.VALID_VERSIONS or (self.postgres_version != 'auto' and not re.fullmatch(r'[0-9]+(?:\.[0-9]+)*', self.postgres_version)):
             raise RecoveryError('VERSION: invalid Odoo or PostgreSQL version')
         resume = self.job is not None
         if not resume:
@@ -494,6 +622,7 @@ USER odoo
                     shutil.copytree(self.custom_addons_dir, self.job.path / 'inputs' / 'custom_addons')
                     self.job.data['config']['addons_sha256'] = hashlib.sha256(json.dumps(inventory(self.custom_addons_dir), sort_keys=True).encode()).hexdigest()
                     self.job.save()
+                self._prepare_restore_input(snapshot)
                 self.create_db_compose_file()
                 self._run_cmd(self.compose_cmd + ['-f', 'db-composer.yml', 'up', '-d'], capture_output=True)
                 self.wait_for_db()
@@ -510,11 +639,7 @@ USER odoo
                     self._verify_copy(directory / 'database.dump', directory / 'filestore', current, manifest['runtime'])
                     self.current_runtime = manifest['runtime']
                 else:
-                    source = self.download_or_copy_source()
-                    self.job.data['input_sha256'] = digest(source)
-                    self.job.save()
-                    kind = self.process_source_file(source)
-                    self.restore_database(kind)
+                    self.restore_database(self.restore_file_type)
                     current = self.get_current_version()
                     if not re.fullmatch(r'\d+\.\d+(?:\.[\w.-]+)*', current):
                         raise RecoveryError('SOURCE_VERSION: could not establish installed base version')

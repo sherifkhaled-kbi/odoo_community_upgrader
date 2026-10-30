@@ -1,3 +1,5 @@
+> Initial CLI implementation report. For the subsequent PostgreSQL restore correction and current validation, see [RESTORE_COMPATIBILITY_FIX.md](RESTORE_COMPATIBILITY_FIX.md).
+
 # Focused implementation handover
 
 The approved scope replaces the earlier remote-worker proposal. The application remains a synchronous Linux-host CLI using local Docker. No SSH, remote orchestration, worker, systemd service, queue, external job database, web/API or authentication feature was added.

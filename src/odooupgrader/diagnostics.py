@@ -67,7 +67,7 @@ def collect(job, exc, evidence=None):
     message = str(exc).split(':', 1)[0]
     allowed_codes = {
         'ADDONS_CHANGED', 'ARTIFACT_INVALID', 'CHECKPOINT_INVALID', 'COMPLETED_RUNTIME',
-        'DATABASE_CONSTRAINT', 'DEPENDENCY_DRIFT', 'DISK_SPACE', 'DOCKER_INSPECT', 'DOWNGRADE',
+        'DATABASE_CONSTRAINT', 'DATABASE_RESTORE_FAILURE', 'DEPENDENCY_DRIFT', 'DISK_SPACE', 'DOCKER_INSPECT', 'DOWNGRADE',
         'FILESTORE_CORRUPT', 'FILESTORE_MISSING', 'FILESTORE_UNSAFE', 'INPUT_EXISTS', 'INPUT_LIMIT',
         'INPUT_PREPARATION', 'INPUT_UNSAFE', 'JOB_BUSY', 'JOB_CONFIGURATION', 'JOB_ID', 'JOB_METADATA',
         'LOCAL_DOCKER_REQUIRED', 'LOCAL_LINUX_REQUIRED', 'MIGRATION_EXIT', 'MODULE_MISSING',
@@ -84,16 +84,25 @@ def collect(job, exc, evidence=None):
     sqlstate = re.search(r'ERROR:\s+([0-9A-Z]{5}):', error_text)
     summary['sqlstate'] = sqlstate[1] if sqlstate else None
     summary['process_exit_code'] = getattr(exc, 'returncode', None)
+    restore = attempt.get('restore', {})
+    if code == 'DATABASE_RESTORE_FAILURE':
+        summary.update(classification=code, restore_reason=restore.get('reason'),
+                       dump_format=(restore.get('dump') or {}).get('format'),
+                       postgres_runtime=restore.get('runtime'),
+                       failing_statement=restore.get('failing_statement'), incompatible_statement=restore.get('incompatible_statement'),
+                       relevant_error=restore.get('relevant_error'),
+                       sqlstate=restore.get('sqlstate'), process_exit_code=restore.get('process_exit_code'))
     summary['failing_module'] = None
     docker_log = Path(attempt['work']) / 'docker.log'
-    if docker_log.is_file():
+    if code != 'DATABASE_RESTORE_FAILURE' and docker_log.is_file():
         with docker_log.open('rb') as stream:
             stream.seek(max(0, docker_log.stat().st_size - 2 * 1024 * 1024))
             matches = re.findall(r'module ([a-zA-Z_][a-zA-Z_0-9]*): Running upgrade', stream.read().decode(errors='replace'))
         if matches:
             summary['failing_module'] = matches[-1]
     atomic_json(directory / 'failure_summary.json', summary)
-    atomic_json(directory / 'environment.json', {'python': platform.python_version(), 'platform': platform.system()})
+    atomic_json(directory / 'restore_diagnostics.json', {'current': restore, 'history': attempt.get('restore_history', [])})
+    atomic_json(directory / 'environment.json', {'python': platform.python_version(), 'platform': platform.system(), 'postgres_runtime': attempt.get('postgres_runtime')})
     atomic_json(directory / 'migration_steps.json', [
         {k: a.get(k) for k in ('id', 'started', 'ended', 'outcome', 'input_checkpoint', 'transitions', 'current_transition')}
         for a in job.data['attempts']])
@@ -120,7 +129,8 @@ def collect(job, exc, evidence=None):
         'Review the exact upstream script/module, dependency inventory and failed stage before retry. '
         'Use resume --dry-run; never retry a partially migrated database.\n\n'
         'This archive contains technical metadata and structural log/traceback evidence only. '
-        'Exception payloads, source literals, SQL/business data, paths, URLs and raw logs are withheld. '
+        'Exception payloads, source literals, business SQL/data, paths, URLs and raw logs are withheld. '
+        'Restore diagnostics allow only known noncustomer timeout SET statements; other SQL remains in restore.private.log locally. '
         'Full raw logs stay in protected local attempt storage and require private review. '
         'No dump, filestore, environment-variable list or customer records are exported. '
         'Unavailable collectors are explicitly marked; collection cannot establish a diagnosis.\n')

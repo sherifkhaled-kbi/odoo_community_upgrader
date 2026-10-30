@@ -13,10 +13,12 @@ python3 -m venv .venv
 The existing invocation remains valid and waits synchronously:
 
 ```bash
-odooupgrader --source /srv/backups/test-backup.zip --version 19.0 --postgres-version 13
+odooupgrader --source /srv/backups/test-backup.zip --version 19.0 --postgres-version auto
 ```
 
 `--extra-addons`, `--verbose`, `--log-file` and URL sources remain available. A custom-format dump can supply `--filestore /srv/backups/matching-filestore`. Sources are copied, never deleted. Installed custom modules need compatible sources/dependencies for **every** intermediate version; unsupported missing modules block verification. Official Odoo image Git revisions may be unavailable and are explicitly recorded as unknown; actual image IDs and dependency inventories are recorded.
+
+**PostgreSQL restore compatibility:** use `--postgres-version auto` to inspect the source-server and pg_dump versions before choosing a supported 13–17 image. An explicit older version is rejected before restore; the original dump is never rewritten. Actual server/client versions and image identity are verified. Unknown headers or newer unsupported formats block with actionable diagnostics. See the [restore compatibility correction](docs/implementation/RESTORE_COMPATIBILITY_FIX.md).
 
 Each run prints a UUID. State defaults to `.odooupgrader/jobs` in the invocation directory; use the same absolute `--jobs-dir` across separate shells:
 

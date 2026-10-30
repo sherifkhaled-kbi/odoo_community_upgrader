@@ -62,3 +62,7 @@ Keep job storage owner-private on a local filesystem with working fsync/rename/l
 Stopped attempt containers, networks and PostgreSQL volumes are deliberately retained. `docker inspect`/labels identify them; never run broad Docker prune or delete a job/checkpoint without a separately reviewed retention decision. Old attempt volumes are diagnostic evidence, not checkpoints. Total server/disk loss is unrecoverable without an independent backup.
 
 Final ZIP retains the existing `dump.sql` + `filestore/` layout and adds checkpoint provenance. ZIP integrity is tested; final target Odoo backup-manager import compatibility and business correctness remain NOT TESTED until isolated server qualification. The job ledger must say COMPLETED before treating a final ZIP as published.
+
+## PostgreSQL restore admission
+
+The [restore compatibility correction](RESTORE_COMPATIBILITY_FIX.md) adds dump-header preflight and `--postgres-version auto` (supported 13–17). Source and pg_dump versions are distinct; newer producer output is not restored to an older server by deleting statements. Numeric choices remain explicit. Auto selection is persisted and reused on resume; actual server/client/image identity is checked before any restore. Failed restore diagnostics never query Odoo tables. No checkpoint or artifact advances after compatibility or restore failure.

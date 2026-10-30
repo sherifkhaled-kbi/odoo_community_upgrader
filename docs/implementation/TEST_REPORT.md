@@ -1,3 +1,5 @@
+> Initial CLI implementation report. For the subsequent PostgreSQL restore correction and current validation, see [RESTORE_COMPATIBILITY_FIX.md](RESTORE_COMPATIBILITY_FIX.md).
+
 # Test execution and server qualification
 
 ## Executed safely in this development workspace
