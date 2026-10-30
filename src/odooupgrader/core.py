@@ -26,7 +26,8 @@ class OdooUpgrader(RecoveryMixin):
 
     def __init__(self, source: str, target_version: str, extra_addons: Optional[str] = None, verbose: bool = False,
                  postgres_version: str = "13", jobs_dir=None, job_id=None, revisions=None,
-                 acceptance=None, reason=None, filestore=None, allow_missing_attachments=False):
+                 acceptance=None, reason=None, filestore=None, allow_missing_attachments=False,
+                 single_copy=False):
         self.source = source
         self.target_version = target_version
         self.extra_addons = extra_addons
@@ -39,7 +40,7 @@ class OdooUpgrader(RecoveryMixin):
         self.custom_addons_dir = os.path.join(self.output_dir, 'custom_addons')
         self.compose_cmd = self._get_docker_compose_cmd()
         self._configure_recovery(jobs_dir, job_id, revisions, acceptance, reason, filestore,
-                                 allow_missing_attachments)
+                                 allow_missing_attachments, single_copy)
 
     def _run_cmd(self, cmd: List[str], check: bool = True, capture_output: bool = False, timeout=None, stdin=None) -> subprocess.CompletedProcess:
         """Executes a subprocess command and logs it."""
@@ -160,9 +161,14 @@ class OdooUpgrader(RecoveryMixin):
             raise RecoveryError('INPUT_PREPARATION: source/addon preparation failed; inspect protected logs')
 
     def download_or_copy_source(self) -> str:
-        """Retain a private immutable input copy; never delete or overwrite the original."""
+        """Retain the input, or read a local single-copy input in place."""
         from urllib.parse import urlsplit
         is_url = self.source.startswith(('http://', 'https://'))
+        if self.single_copy and not is_url:
+            source = Path(self.source).resolve(strict=True)
+            if not source.is_file():
+                raise RecoveryError('RESTORE_INPUT: source must be a regular file')
+            return str(source)
         extension = '.zip' if urlsplit(self.source).path.lower().endswith('.zip') else '.dump'
         destination = self.job.path / 'inputs' / ('source' + extension)
         if destination.exists():
@@ -293,18 +299,17 @@ class OdooUpgrader(RecoveryMixin):
 
     def process_source_file(self, filepath: str) -> str:
         """Extracts ZIP or prepares DUMP file."""
-        ext = os.path.splitext(filepath)[1].lower()
-
         if zipfile.is_zipfile(filepath):
             console.print("[blue]Extracting ZIP file...[/blue]")
             logger.info("Extracting ZIP file...")
-            with zipfile.ZipFile(filepath, 'r') as zip_ref:
-                extract_zip(filepath, self.source_dir)
+            extract_zip(filepath, self.source_dir)
+            self.prepared_dump_path = Path(self.source_dir) / 'dump.sql'
             return "ZIP"
         else:
             console.print("[blue]Processing DUMP file...[/blue]")
             logger.info("Processing DUMP file...")
-            shutil.copy2(filepath, os.path.join(self.source_dir, "database.dump"))
+            # download_or_copy_source already retained one private input copy.
+            self.prepared_dump_path = Path(filepath)
             return "DUMP"
 
 

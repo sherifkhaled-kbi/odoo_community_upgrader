@@ -181,7 +181,16 @@ class Job:
         parent = self.path / 'checkpoints'
         stage = parent / ('.staging-' + identifier)
         stage.mkdir(mode=0o700)
-        validation = builder(stage)
+        try:
+            validation = builder(stage)
+        except BaseException:
+            if self.data['config'].get('single_copy'):
+                # An incomplete streamed ZIP is not a checkpoint and may be large.
+                try:
+                    shutil.rmtree(stage)
+                except OSError:
+                    pass  # Preserve the original export failure for diagnostics.
+            raise
         if not validation.get('passed'):
             raise RecoveryError('VALIDATION_FAILED: checkpoint candidate did not pass')
         files = inventory(stage)
@@ -189,6 +198,8 @@ class Job:
                     'parent': self.data['latest_checkpoint'], 'attempt': self.data['attempts'][-1]['id'],
                     'runtime': runtime, 'source_sha256': self.data.get('input_sha256'),
                     'validation': validation, 'files': files, 'created': time.time()}
+        if validation.get('checkpoint_format') == 'zip':
+            manifest['checkpoint_format'] = 'zip'
         atomic_json(stage / 'manifest.json', manifest)
         for path in stage.rglob('*'):
             if path.is_file():

@@ -13,7 +13,7 @@ import traceback
 import uuid
 import zipfile
 
-from .checks import FACTOR_FIX_SCRIPT_SHA256, LIBRARY_REVISION, OPENUPGRADE_REVISIONS, validate_uom, verify_attachments
+from .checks import FACTOR_FIX_SCRIPT_SHA256, LIBRARY_REVISION, OPENUPGRADE_REVISIONS, extract_zip, validate_uom, verify_attachments
 from .diagnostics import RedactionFilter, collect
 from .jobs import Job, RecoveryError, atomic_json, digest, inventory, require_space, sync_dir
 from .postgres_restore import (RestoreFailure, inspect_dump, select_runtime, validate_runtime, client_version, version_number, sql_failure_evidence)
@@ -23,7 +23,7 @@ logger = logging.getLogger('odooupgrader')
 
 class RecoveryMixin:
     def _configure_recovery(self, jobs_dir, job_id, revisions, acceptance, reason, filestore,
-                            allow_missing_attachments):
+                            allow_missing_attachments, single_copy):
         self.jobs_dir = Path(jobs_dir or Path.cwd() / '.odooupgrader' / 'jobs').resolve()
         self.job = Job(self.jobs_dir, job_id) if job_id else None
         if self.job and (self.target_version != self.job.data['target'] or self.postgres_version != self.job.data['postgres']):
@@ -37,6 +37,8 @@ class RecoveryMixin:
         self.input_filestore = filestore
         self.allow_missing_attachments = (self.job.data['config'].get('allow_missing_attachments', False)
                                           if self.job else allow_missing_attachments)
+        self.single_copy = (self.job.data['config'].get('single_copy', False)
+                            if self.job else single_copy)
         self._handler = None
         self.db_container = None
         self.network = None
@@ -48,6 +50,7 @@ class RecoveryMixin:
         self.pg_runtime = None
         self._database_restored = False
         self._restore_failed = False
+        self.prepared_dump_path = None
 
     def _runtime_plan(self):
         package = Path(__file__).parent
@@ -92,7 +95,9 @@ class RecoveryMixin:
                 'target': self.job.data['target'], 'state': self.job.data['state'],
                 'runtime_diff': change, 'change_sha256': change_hash,
                 'built_runtime_candidates': self.job.data.get('runtime_candidates', {}),
-                'deferred_checks': ['exclusive ownership', 'Docker reconciliation', 'fresh restore', 'registry verification', 'disk capacity']}
+                'deferred_checks': ['exclusive ownership', 'Docker reconciliation', 'fresh restore', 'registry verification', 'disk capacity'],
+                'checkpoint_format': manifest.get('checkpoint_format', 'directory'),
+                'independent_restore_verified': manifest['validation'].get('independent_restore', True)}
 
     def assert_local_docker(self):
         if sys.platform != 'linux':
@@ -193,14 +198,20 @@ class RecoveryMixin:
         self.attempt['restore'] = context
         try:
             if snapshot:
-                directory, _ = snapshot
-                path = directory / 'database.dump'
-                self.restore_file_type = 'DUMP'
+                directory, manifest = snapshot
+                if manifest.get('checkpoint_format') == 'zip':
+                    extract_zip(directory / 'checkpoint.zip', self.source_dir)
+                    self.prepared_dump_path = Path(self.source_dir) / 'dump.sql'
+                    path = self.prepared_dump_path
+                    self.restore_file_type = 'ZIP'
+                else:
+                    path = directory / 'database.dump'
+                    self.restore_file_type = 'DUMP'
             else:
                 source = self.download_or_copy_source()
                 self.job.data['input_sha256'] = digest(source)
                 self.restore_file_type = self.process_source_file(source)
-                path = Path(self.source_dir) / ('dump.sql' if self.restore_file_type == 'ZIP' else 'database.dump')
+                path = self.prepared_dump_path
             context['input_container'] = 'checkpoint' if snapshot else ('zip' if self.restore_file_type == 'ZIP' else 'file')
             metadata = inspect_dump(path)
             context['dump'] = metadata
@@ -369,15 +380,34 @@ class RecoveryMixin:
                 'database restoration failed before migration; inspect restore_diagnostics.json and protected restore.private.log', context) from exc
 
     def restore_database(self, file_type):
-        path = Path(self.source_dir) / ('dump.sql' if file_type == 'ZIP' else 'database.dump')
+        path = self.prepared_dump_path
+        if path is None:
+            raise RecoveryError('RESTORE_INPUT: source dump was not prepared')
         if not path.is_file():
             raise RecoveryError('RESTORE_INPUT: expected dump.sql or custom-format database.dump')
         if file_type == 'ZIP' and (Path(self.source_dir) / 'filestore').is_dir():
-            shutil.copytree(Path(self.source_dir) / 'filestore', self.filestore_dir, dirs_exist_ok=True)
+            # Both paths belong to the same attempt. Move the extracted store
+            # into Odoo's data root without duplicating its contents.
+            Path(self.filestore_dir).rmdir()
+            try:
+                os.rename(Path(self.source_dir) / 'filestore', self.filestore_dir)
+            except OSError:
+                Path(self.filestore_dir).mkdir()
+                raise
         elif self.input_filestore:
-            inventory(self.input_filestore)
+            original_files = inventory(self.input_filestore)
             shutil.copytree(self.input_filestore, self.filestore_dir, dirs_exist_ok=True)
+            if inventory(self.filestore_dir) != original_files:
+                raise RecoveryError('FILESTORE_CHANGED: input filestore changed while it was copied')
         self._restore_dump(path, 'database', sql=(self.attempt.get('restore', {}).get('dump') or {}).get('format') == 'plain_sql')
+        if self.single_copy and self.source and not self.source.startswith(('http://', 'https://')):
+            if digest(self.source) != self.job.data['input_sha256']:
+                raise RecoveryError('SOURCE_CHANGED: local backup changed during the restore')
+        if self.single_copy and file_type == 'ZIP':
+            try:
+                path.unlink()  # The original ZIP or completed checkpoint remains available.
+            except OSError:
+                logger.warning('Restored ZIP input could not be removed from the working directory')
 
     def _technical(self, expected, filestore, database='database'):
         modules = self._rows('SELECT name, state, latest_version FROM ir_module_module ORDER BY name', database)
@@ -418,6 +448,12 @@ class RecoveryMixin:
         available = int(output.splitlines()[-1].split()[3]) * 1024
         if available < 2 * db_bytes + 256 * 1024**2:
             raise RecoveryError('DISK_SPACE: PostgreSQL volume lacks verification/restore headroom')
+
+    def _single_copy_capacity(self):
+        """Keep a modest reserve; no second database or filestore is created."""
+        db_bytes = int(self._sql('SELECT pg_database_size(current_database())'))
+        reserve = max(2 * 1024**3, db_bytes // 10)
+        require_space(self.cwd, reserve)
 
     def _normal_image(self, major):
         reference = 'odoo:' + major
@@ -627,6 +663,76 @@ USER odoo
         dump.unlink()
         return destination
 
+    def _write_compact_checkpoint_zip(self, destination, version, validation):
+        """Stream the working DB and filestore to one immutable checkpoint ZIP."""
+        files = inventory(self.filestore_dir)  # Reject links and special files before archiving.
+        def copy_with_reserve(source, target):
+            while block := source.read(1024 * 1024):
+                require_space(self.cwd, len(block))
+                target.write(block)
+        metadata = {'job_id': self.job.id, 'version': version,
+                    'source_sha256': self.job.data.get('input_sha256'),
+                    'storage_mode': 'single_copy', 'validation': dict(validation, registry=True,
+                    independent_restore=False), 'runtime': self.current_runtime}
+        command = ['docker', 'exec', self.db_container, 'pg_dump', '-U', 'odoo', 'database']
+        private_log = Path(self.cwd) / 'export.private.log'
+        with zipfile.ZipFile(destination, 'w', zipfile.ZIP_DEFLATED, allowZip64=True) as archive:
+            with private_log.open('wb') as errors:
+                process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=errors)
+                try:
+                    with archive.open('dump.sql', 'w', force_zip64=True) as stream:
+                        copy_with_reserve(process.stdout, stream)
+                    process.stdout.close()
+                    if process.wait() != 0:
+                        raise RecoveryError('EXPORT_FAILED: pg_dump failed; inspect protected export.private.log')
+                except BaseException:
+                    if process.poll() is None:
+                        process.kill()
+                    process.stdout.close()
+                    process.wait()
+                    raise
+            for name in files:
+                with (Path(self.filestore_dir) / name).open('rb') as source:
+                    with archive.open('filestore/' + name, 'w', force_zip64=True) as target:
+                        copy_with_reserve(source, target)
+            archive.writestr('odooupgrader-run.json', json.dumps(metadata, sort_keys=True))
+        with zipfile.ZipFile(destination) as archive:
+            if archive.testzip() is not None:
+                raise RecoveryError('CHECKPOINT_INVALID: ZIP integrity failed')
+        destination.chmod(0o400)
+
+    def _single_copy_checkpoint(self, version):
+        """Publish a ZIP after a successful transition without duplicating live data."""
+        self.job.stage('CHECKPOINTING')
+        self._single_copy_capacity()
+        self._probe('database', self.filestore_dir, self.current_runtime['image_id'])
+        validation = self._technical(version, self.filestore_dir)
+        if version == '19.0' and self.uom_baseline is not None:
+            from .checks import verify_uom_ratios
+            verify_uom_ratios(self.uom_baseline, self._rows('SELECT id, factor FROM uom_uom ORDER BY id'))
+            validation['uom_ratios'] = 'passed'
+        validation.update(registry=True, independent_restore=False,
+                          checkpoint_format='zip')
+        def build(stage):
+            self._write_compact_checkpoint_zip(stage / 'checkpoint.zip', version, validation)
+            return validation
+        self.job.publish(version, self.current_runtime, build)
+        return validation
+
+    def finalize_single_copy_package(self, version):
+        """Expose the final checkpoint ZIP as the output without copying bytes."""
+        self.job.stage('FINALIZING')
+        checkpoint, manifest = self.job.checkpoint()
+        if manifest['version'] != version or manifest.get('checkpoint_format') != 'zip':
+            raise RecoveryError('CHECKPOINT_INVALID: final ZIP does not match the target version')
+        source = checkpoint / 'checkpoint.zip'
+        destination = Path(self.output_dir) / 'upgraded.zip'
+        os.link(source, destination)
+        sync_dir(destination.parent)
+        self.job.data['artifact'] = {'path': str(destination), 'sha256': digest(destination),
+                                     'independent_restore_verified': False}
+        return destination
+
     def failure_evidence(self):
         evidence = {}
         if self._database_restored and not self._restore_failed:
@@ -657,8 +763,11 @@ USER odoo
         if not resume:
             self.job = Job.create(self.jobs_dir, self.target_version, self.postgres_version,
                 {'runtime_plan': self._runtime_plan(), 'extra_addons': bool(self.extra_addons),
-                 'allow_missing_attachments': self.allow_missing_attachments})
+                 'allow_missing_attachments': self.allow_missing_attachments,
+                 'single_copy': self.single_copy})
         console.print('Job ID: ' + self.job.id)
+        if self.single_copy:
+            console.print('Storage mode: one working database/filestore; ZIP checkpoint after each successful version')
         with self.job.lock():
             if self.job.data['state'] == 'COMPLETED':
                 return self.job.data['artifact']['path']
@@ -672,6 +781,14 @@ USER odoo
                 for previous in previous_attempts:
                     self._stop_attempt(previous)
                 self.prepare_environment()
+                if self.single_copy and snapshot and snapshot[1]['version'] == self.target_version:
+                    artifact = self.finalize_single_copy_package(self.target_version)
+                    self.attempt.update(outcome='SUCCEEDED', ended=time.time())
+                    self.job.data.update(state='COMPLETED', stage='COMPLETED')
+                    self.job.save()
+                    console.print('Upgrade complete: ' + str(artifact))
+                    console.print('Independent restore verification was not run for this ZIP checkpoint.')
+                    return str(artifact)
                 self.job.stage('INPUT_PREPARATION')
                 if resume:
                     addon = self.job.path / 'inputs' / 'custom_addons'
@@ -695,13 +812,19 @@ USER odoo
                 if snapshot:
                     directory, manifest = snapshot
                     self.module_baseline = manifest['validation']['modules']
-                    self._restore_dump(directory / 'database.dump', 'database')
-                    shutil.copytree(directory / 'filestore', self.filestore_dir, dirs_exist_ok=True)
+                    if manifest.get('checkpoint_format') == 'zip':
+                        self.restore_database('ZIP')
+                    else:
+                        self._restore_dump(directory / 'database.dump', 'database')
+                        shutil.copytree(directory / 'filestore', self.filestore_dir, dirs_exist_ok=True)
                     current = manifest['version']
                     self._technical(current, self.filestore_dir)
-                    # Verify normal startup only on a disposable snapshot copy, never on
-                    # the actual attempt DB that the next migration will consume.
-                    self._verify_copy(directory / 'database.dump', directory / 'filestore', current, manifest['runtime'])
+                    if manifest.get('checkpoint_format') == 'zip':
+                        self._probe('database', self.filestore_dir, manifest['runtime']['image_id'])
+                    else:
+                        # Verify normal startup only on a disposable snapshot copy, never on
+                        # the actual attempt DB that the next migration will consume.
+                        self._verify_copy(directory / 'database.dump', directory / 'filestore', current, manifest['runtime'])
                     self.current_runtime = manifest['runtime']
                 else:
                     self.restore_database(self.restore_file_type)
@@ -719,25 +842,37 @@ USER odoo
                         'openupgradelib': None, 'odoo_revision': None,
                         'application_fingerprint': self._runtime_plan()['application_fingerprint'],
                         'postgres': self._sql('SHOW server_version')}
-                    self._checkpoint(current, self.current_runtime)
+                    if not self.single_copy:
+                        self._checkpoint(current, self.current_runtime)
                 while int(current.split('.')[0]) < int(self.target_version.split('.')[0]):
                     target = self.generate_next_version(current)
                     transition = {'source': current, 'target': target, 'outcome': 'RUNNING'}
                     self.attempt['transitions'].append(transition)
                     self.attempt['current_transition'] = current + ' -> ' + target
                     self.job.stage('PREFLIGHT_' + target)
-                    self._capacity()
+                    if self.single_copy:
+                        self._single_copy_capacity()
+                    else:
+                        self._capacity()
                     self.run_upgrade_step(target)
-                    self._checkpoint(target, self.current_runtime)
+                    if self.single_copy:
+                        validation = self._single_copy_checkpoint(target)
+                        self.module_baseline = validation['modules']
+                    else:
+                        self._checkpoint(target, self.current_runtime)
+                        self.module_baseline = self.job.checkpoint()[1]['validation']['modules']
                     transition['outcome'] = 'SUCCEEDED'
-                    self.module_baseline = self.job.checkpoint()[1]['validation']['modules']
                     current = target
                     self.job.save()
-                artifact = self.finalize_package()
+                if self.single_copy and self.job.data['latest_checkpoint'] is None:
+                    self._single_copy_checkpoint(current)
+                artifact = self.finalize_single_copy_package(current) if self.single_copy else self.finalize_package()
                 self.attempt.update(outcome='SUCCEEDED', ended=time.time())
                 self.job.data.update(state='COMPLETED', stage='COMPLETED')
                 self.job.save()
                 console.print('Upgrade complete: ' + str(artifact))
+                if self.single_copy:
+                    console.print('Independent restore verification was not run for this ZIP checkpoint.')
                 return str(artifact)
             except BaseException as exc:
                 self.attempt.update(outcome='INTERRUPTED' if isinstance(exc, (KeyboardInterrupt, SystemExit)) else 'FAILED', ended=time.time())
