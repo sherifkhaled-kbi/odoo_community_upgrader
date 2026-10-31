@@ -566,19 +566,25 @@ class RecoveryMixin:
         return {child.name for child in base.iterdir() if child.is_dir() and (child / '__manifest__.py').is_file()}
 
     def _image_module_names(self, image_ref, path_in_image):
-        """Best-effort module inventory read via `docker create`/`cp`; never starts the container."""
+        """Module inventory read via `docker create`/`cp`; never starts the container.
+
+        Raises rather than degrading to an empty set: a failed inspection must never be
+        mistaken for "nothing is there", or every installed module would look missing.
+        """
         container = None
         dest = Path(self.cwd) / ('addon-scan-' + uuid.uuid4().hex)
         try:
-            container = self._run_cmd(['docker', 'create', image_ref], capture_output=True).stdout.strip()
-            result = self._run_cmd(['docker', 'cp', f'{container}:{path_in_image}', str(dest)],
-                                   check=False, capture_output=True)
+            try:
+                container = self._run_cmd(['docker', 'create', image_ref], capture_output=True).stdout.strip()
+                result = self._run_cmd(['docker', 'cp', f'{container}:{path_in_image}', str(dest)],
+                                       check=False, capture_output=True)
+            except subprocess.CalledProcessError as exc:
+                raise RecoveryError(f'MODULE_SCAN_FAILED: could not create a container from {image_ref} to '
+                                    f'inspect {path_in_image}: {redact((exc.stderr or "")[-2048:])}') from exc
             if result.returncode:
-                return set()
+                raise RecoveryError(f'MODULE_SCAN_FAILED: docker cp {image_ref}:{path_in_image} failed '
+                                    f'(exit {result.returncode}): {redact((result.stderr or "")[-2048:])}')
             return self._scan_manifest_names(dest)
-        except Exception:
-            logger.warning('Could not inspect %s for addon modules at %s', image_ref, path_in_image)
-            return set()
         finally:
             shutil.rmtree(dest, ignore_errors=True)
             if container:
@@ -595,20 +601,23 @@ class RecoveryMixin:
         """Catch modules the restored database still needs that no addons-path provides,
         before the long migration container runs (rather than a silent REGISTRY_VALIDATION
         failure ~20 minutes in)."""
+        from .core import console
+        if self.skip_missing_modules_check:
+            logger.warning('Skipping missing-module preflight (--skip-missing-modules-check) for %s', target_version)
+            console.print(f'[yellow]Warning: skipping missing-module check for {target_version} '
+                          f'(--skip-missing-modules-check)[/yellow]')
+            return
         rows = self._rows("SELECT name, state, latest_version FROM ir_module_module "
                           "WHERE state IN ('installed', 'to upgrade', 'to install') ORDER BY name", 'database')
         mapping = prepared['environment'].get('module_mapping', {})
         available = self._known_addon_names(target_version, prepared['image_id'])
+        if 'base' not in available:
+            # base ships in every Odoo image; its absence means the scan itself is
+            # broken (wrong path, image layout drift), not that modules are missing.
+            raise RecoveryError('MODULE_SCAN_FAILED: addon inventory for ' + target_version +
+                                " looks wrong (the always-present 'base' module was not found)")
         missing = [r for r in rows if r['name'] not in available and r['name'] not in mapping]
         if not missing:
-            return
-        from .core import console
-        if self.skip_missing_modules_check:
-            logger.warning('Skipping missing-module preflight (--skip-missing-modules-check): %d module(s) '
-                           'not found in addons-path for %s: %s', len(missing), target_version,
-                           ', '.join(r['name'] for r in missing))
-            console.print(f'[yellow]Warning: skipping missing-module check for {len(missing)} module(s) '
-                          f'(--skip-missing-modules-check)[/yellow]')
             return
         console.print(f'[bold red]{len(missing)} module(s) installed in the database are missing from the '
                      f'addons-path for {target_version}; the upgrade would fail:[/bold red]')

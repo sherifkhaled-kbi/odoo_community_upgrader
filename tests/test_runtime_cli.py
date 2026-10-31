@@ -407,10 +407,10 @@ def test_actual_image_capability_probe_guards_18_without_breaking_17(upgrader, m
             return SimpleNamespace(stdout='sha256:test')
         if cmd[-3:] == ['-m', 'pip', 'check']:
             return SimpleNamespace(returncode=0, stdout='', stderr='')
-        return SimpleNamespace(stdout='', stderr='')
+        return SimpleNamespace(stdout='', stderr='', returncode=0)
     upgrader._run_cmd = command
     upgrader._sql = lambda *a, **k: '13.fixture'
-    upgrader._rows = lambda *a, **k: []  # Not under test here; see test_missing_module_preflight_*.
+    upgrader._missing_module_preflight = lambda *a, **k: None  # Not under test here; see test_missing_module_preflight_*.
     upgrader._inspect_owned = lambda *a: {'State': {'ExitCode': 0, 'Running': False}}
     recorded_plan = upgrader._runtime_plan()
     upgrader._runtime_plan = lambda: recorded_plan
@@ -491,6 +491,38 @@ def test_missing_module_preflight_detects_and_skip_flag_works(upgrader, tmp_path
     assert [m['name'] for m in upgrader.attempt['missing_modules']] == ['custom_ext']
     upgrader.skip_missing_modules_check = True
     upgrader._missing_module_preflight('18.0', prepared)  # no raise with the override flag
+
+
+def test_image_module_scan_raises_on_docker_cp_failure(upgrader):
+    def command(cmd, **kwargs):
+        if cmd[:2] == ['docker', 'create']:
+            return SimpleNamespace(stdout='containerid\n', stderr='')
+        if cmd[:2] == ['docker', 'cp']:
+            return SimpleNamespace(returncode=1, stdout='', stderr='Error: No such container:path')
+        return SimpleNamespace(stdout='', stderr='', returncode=0)
+    upgrader._run_cmd = command
+    with pytest.raises(RecoveryError, match='MODULE_SCAN_FAILED'):
+        upgrader._image_module_names('odoo:18.0', '/some/path')
+
+
+def test_image_module_scan_raises_on_docker_create_failure(upgrader):
+    def command(cmd, **kwargs):
+        if cmd[:2] == ['docker', 'create']:
+            raise subprocess.CalledProcessError(1, cmd, stderr='no such image')
+        return SimpleNamespace(stdout='', stderr='', returncode=0)
+    upgrader._run_cmd = command
+    with pytest.raises(RecoveryError, match='MODULE_SCAN_FAILED'):
+        upgrader._image_module_names('odoo:18.0', '/some/path')
+
+
+def test_missing_module_preflight_fails_loudly_when_scan_cannot_find_base(upgrader):
+    """A scan that silently returns nothing (e.g. docker cp broke) must never be
+    read as 'every installed module is missing' - it should fail distinctly instead."""
+    upgrader._rows = lambda *a, **k: [{'name': 'base', 'state': 'installed', 'latest_version': '18.0.1.0'}]
+    upgrader._image_module_names = lambda image, path: set()
+    prepared = {'image_id': 'sha256:fake', 'environment': {'module_mapping': {}}}
+    with pytest.raises(RecoveryError, match='MODULE_SCAN_FAILED'):
+        upgrader._missing_module_preflight('18.0', prepared)
 
 
 @pytest.mark.parametrize(('line', 'expected'), [
