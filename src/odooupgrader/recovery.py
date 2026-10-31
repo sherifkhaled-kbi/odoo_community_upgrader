@@ -9,6 +9,7 @@ import select
 import shutil
 import subprocess
 import sys
+import tarfile
 import time
 import traceback
 import uuid
@@ -565,28 +566,55 @@ class RecoveryMixin:
             return set()
         return {child.name for child in base.iterdir() if child.is_dir() and (child / '__manifest__.py').is_file()}
 
+    @staticmethod
+    def _manifest_names_in_tar(stream, path_in_image):
+        """Module names under `path_in_image` found by listing a tar stream's member
+        names only; never extracts, so symlinks that escape their directory (e.g. the
+        official image's bundled fonts) can't break the scan the way `docker cp` does."""
+        prefix = path_in_image.strip('/') + '/'
+        names = set()
+        with tarfile.open(fileobj=stream, mode='r|') as archive:
+            for member in archive:
+                if not member.name.startswith(prefix):
+                    continue
+                parts = member.name[len(prefix):].split('/')
+                if len(parts) == 2 and parts[1] == '__manifest__.py':
+                    names.add(parts[0])
+        return names
+
     def _image_module_names(self, image_ref, path_in_image):
-        """Module inventory read via `docker create`/`cp`; never starts the container.
+        """Module inventory read via `docker create`/`export`; never starts the container.
 
         Raises rather than degrading to an empty set: a failed inspection must never be
         mistaken for "nothing is there", or every installed module would look missing.
         """
         container = None
-        dest = Path(self.cwd) / ('addon-scan-' + uuid.uuid4().hex)
         try:
             try:
                 container = self._run_cmd(['docker', 'create', image_ref], capture_output=True).stdout.strip()
-                result = self._run_cmd(['docker', 'cp', f'{container}:{path_in_image}', str(dest)],
-                                       check=False, capture_output=True)
             except subprocess.CalledProcessError as exc:
                 raise RecoveryError(f'MODULE_SCAN_FAILED: could not create a container from {image_ref} to '
                                     f'inspect {path_in_image}: {redact((exc.stderr or "")[-2048:])}') from exc
-            if result.returncode:
-                raise RecoveryError(f'MODULE_SCAN_FAILED: docker cp {image_ref}:{path_in_image} failed '
-                                    f'(exit {result.returncode}): {redact((result.stderr or "")[-2048:])}')
-            return self._scan_manifest_names(dest)
+            process = subprocess.Popen(['docker', 'export', container], cwd=self.cwd,
+                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            try:
+                names = self._manifest_names_in_tar(process.stdout, path_in_image)
+            except Exception as exc:
+                process.stdout.close()
+                process.wait()
+                stderr = (process.stderr.read() or b'').decode(errors='replace')
+                process.stderr.close()
+                raise RecoveryError(f'MODULE_SCAN_FAILED: could not read the {image_ref} export to inspect '
+                                    f'{path_in_image}: {redact(stderr[-2048:] or str(exc))}') from exc
+            process.stdout.close()
+            return_code = process.wait()
+            stderr = (process.stderr.read() or b'').decode(errors='replace')
+            process.stderr.close()
+            if return_code:
+                raise RecoveryError(f'MODULE_SCAN_FAILED: docker export {image_ref} failed '
+                                    f'(exit {return_code}): {redact(stderr[-2048:])}')
+            return names
         finally:
-            shutil.rmtree(dest, ignore_errors=True)
             if container:
                 self._run_cmd(['docker', 'rm', '-f', container], check=False, capture_output=True)
 

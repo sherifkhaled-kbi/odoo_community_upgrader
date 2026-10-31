@@ -493,16 +493,61 @@ def test_missing_module_preflight_detects_and_skip_flag_works(upgrader, tmp_path
     upgrader._missing_module_preflight('18.0', prepared)  # no raise with the override flag
 
 
-def test_image_module_scan_raises_on_docker_cp_failure(upgrader):
+def test_image_module_scan_raises_on_docker_export_failure(upgrader, monkeypatch):
+    import io
+
     def command(cmd, **kwargs):
         if cmd[:2] == ['docker', 'create']:
             return SimpleNamespace(stdout='containerid\n', stderr='')
-        if cmd[:2] == ['docker', 'cp']:
-            return SimpleNamespace(returncode=1, stdout='', stderr='Error: No such container:path')
         return SimpleNamespace(stdout='', stderr='', returncode=0)
     upgrader._run_cmd = command
+
+    class FakeProcess:
+        def __init__(self):
+            self.stdout = io.BytesIO(b'')  # Empty/invalid tar stream, as a failed export would yield.
+            self.stderr = io.BytesIO(b'Error response from daemon: No such container: containerid')
+        def wait(self, timeout=None):
+            return 1
+    monkeypatch.setattr('subprocess.Popen', lambda *a, **k: FakeProcess())
     with pytest.raises(RecoveryError, match='MODULE_SCAN_FAILED'):
         upgrader._image_module_names('odoo:18.0', '/some/path')
+
+
+def test_image_module_scan_finds_manifests_by_listing_tar_members(upgrader, monkeypatch):
+    """Guards against the real production bug: `docker cp` rejects directory trees
+    containing symlinks that escape the copied root (e.g. the official image's
+    bundled fonts under point_of_sale); listing tar members must not care."""
+    import io
+    import tarfile
+
+    def command(cmd, **kwargs):
+        if cmd[:2] == ['docker', 'create']:
+            return SimpleNamespace(stdout='containerid\n', stderr='')
+        return SimpleNamespace(stdout='', stderr='', returncode=0)
+    upgrader._run_cmd = command
+
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode='w') as archive:
+        for name, size in [('addons/account/__manifest__.py', 2),
+                            ('addons/point_of_sale/static/src/fonts/Inconsolata.otf', 0)]:
+            info = tarfile.TarInfo(name)
+            info.size = size
+            if size:
+                archive.addfile(info, io.BytesIO(b'{}'))
+            else:
+                info.type = tarfile.SYMTYPE
+                info.linkname = '../../../../../../share/fonts/truetype/inconsolata/Inconsolata.otf'
+                archive.addfile(info)
+    buffer.seek(0)
+
+    class FakeProcess:
+        def __init__(self):
+            self.stdout = buffer
+            self.stderr = io.BytesIO(b'')
+        def wait(self, timeout=None):
+            return 0
+    monkeypatch.setattr('subprocess.Popen', lambda *a, **k: FakeProcess())
+    assert upgrader._image_module_names('odoo:18.0', '/addons') == {'account'}
 
 
 def test_image_module_scan_raises_on_docker_create_failure(upgrader):
