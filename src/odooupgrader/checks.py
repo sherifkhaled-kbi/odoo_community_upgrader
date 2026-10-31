@@ -10,11 +10,7 @@ OPENUPGRADE_REVISIONS = {
     '18.0': 'a393ddbe56b6913eea1e77b42be93152ac00b16d',
     '19.0': 'bf12c3cee6097145e53efa589b0d99a7e64d6a87',
 }
-# Stopgap: OCA/openupgradelib#462 ("lift_constraints: skip not-null constraints") fixes
-# PG18's lift_constraints('...', 'id', cascade=True) failing with "column is in a primary
-# key" (hit in stock_account/19.0.1.1 and hr_recruitment/19.0.1.1 post-migration scripts).
-# Unmerged as of 2026-10-31; re-pin to an official revision once it lands upstream.
-LIBRARY_REVISION = '327a371f9e176278c01b5d4f013cf4134180233e'
+LIBRARY_REVISION = '565d0b33391271a4b2ac27eff8ae19f72fe27d77'
 # Exact PR #6054 source tested in fixtures; never selected automatically.
 FACTOR_FIX_SCRIPT_SHA256 = '85773a46db54fbeb8d5ed3e8358ca0ccc4c559864501144c3e75413a80d490a3'
 

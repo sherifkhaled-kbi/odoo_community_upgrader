@@ -22,6 +22,26 @@ from .postgres_restore import (RestoreFailure, inspect_dump, select_runtime, val
 
 logger = logging.getLogger('odooupgrader')
 
+# Stopgap for OCA/openupgradelib#462 ("lift_constraints: skip not-null constraints"),
+# unmerged as of 2026-10-31: on PostgreSQL 18, lift_constraints('...', 'id', cascade=True)
+# fails with "column is in a primary key" (hit in stock_account/19.0.1.1 and
+# hr_recruitment/19.0.1.1 post-migration scripts), because PG18 makes NOT NULL a named
+# pg_constraint entry that lift_constraints also tries to drop. The PR's own branch
+# predates LIBRARY_REVISION and is missing later unrelated fixes (e.g.
+# add_inherits_parent_xmlids, needed for 17->18), so its exact one-line SQL change is
+# applied as a source patch on top of LIBRARY_REVISION rather than pinning to the PR
+# branch itself. Remove once #462 merges into an official revision.
+LIFT_CONSTRAINTS_FIX = [
+    ('        "where t.relname=%(table)s and attname=%(column)s "\n'
+     '        "union select t.relname, c.conname "\n',
+     '        "where t.relname=%(table)s and attname=%(column)s "\n'
+     '        "and c.contype != \'n\' "\n'
+     '        "union select t.relname, c.conname "\n'),
+    ('        "where relname=%(table)s and attname=%(column)s) in_out "\n',
+     '        "where relname=%(table)s and attname=%(column)s "\n'
+     '        "and c.contype != \'n\') in_out "\n'),
+]
+
 
 class RecoveryMixin:
     # Odoo's official Debian-packaged image layout; used only as best-effort preflight evidence.
@@ -860,12 +880,25 @@ class RecoveryMixin:
             shutil.copytree(self.custom_addons_dir, build / 'custom_addons')
             custom = ('COPY --chown=odoo:odoo custom_addons /mnt/custom-addons\n'
                       'RUN if pip3 install --help | grep -q -- --break-system-packages; then PIP_BREAK_SYSTEM_PACKAGES=1 pip3 install --no-cache-dir -r /mnt/custom-addons/requirements.txt; else pip3 install --no-cache-dir -r /mnt/custom-addons/requirements.txt; fi\n')
+        patch_script = (
+            'import importlib.util\n'
+            'path = importlib.util.find_spec("openupgradelib.openupgrade").origin\n'
+            'text = open(path).read()\n'
+            'replacements = ' + repr(LIFT_CONSTRAINTS_FIX) + '\n'
+            'for old, new in replacements:\n'
+            '    assert text.count(old) == 1, old\n'
+            '    text = text.replace(old, new)\n'
+            'open(path, "w").write(text)\n'
+        )
+        (build / 'patch_lift_constraints.py').write_text(patch_script)
         safe_git = 'git -c safe.directory=/mnt/extra-addons -C /mnt/extra-addons'
         recipe = f'''FROM odoo:{target_version}
 USER root
 RUN apt-get update && apt-get install -y git && rm -rf /var/lib/apt/lists/*
 RUN git init /mnt/extra-addons && {safe_git} remote add origin https://github.com/OCA/OpenUpgrade.git && {safe_git} fetch --depth 1 origin {revision} && {safe_git} checkout --detach FETCH_HEAD && test "$({safe_git} rev-parse HEAD)" = "{revision}"
 RUN if pip3 install --help | grep -q -- --break-system-packages; then PIP_BREAK_SYSTEM_PACKAGES=1 pip3 install --no-cache-dir -r /mnt/extra-addons/requirements.txt && PIP_BREAK_SYSTEM_PACKAGES=1 pip3 install --no-deps --force-reinstall "openupgradelib @ git+https://github.com/OCA/openupgradelib.git@{LIBRARY_REVISION}"; else pip3 install --no-cache-dir -r /mnt/extra-addons/requirements.txt && pip3 install --no-deps --force-reinstall "openupgradelib @ git+https://github.com/OCA/openupgradelib.git@{LIBRARY_REVISION}"; fi
+COPY patch_lift_constraints.py /tmp/patch_lift_constraints.py
+RUN python3 /tmp/patch_lift_constraints.py && rm /tmp/patch_lift_constraints.py
 {custom}
 USER odoo
 '''
