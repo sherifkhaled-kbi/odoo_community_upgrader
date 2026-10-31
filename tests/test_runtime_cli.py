@@ -170,7 +170,7 @@ def test_migration_build_dependency_error_prevents_container_execution(upgrader)
         upgrader.run_upgrade_step('18.0')
     assert len(calls) == 1
     recipe = (Path(upgrader.cwd) / 'build' / '18.0' / 'Dockerfile').read_text()
-    assert '565d0b33391271a4b2ac27eff8ae19f72fe27d77' in recipe
+    assert LIBRARY_REVISION in recipe
     assert 'safe.directory=/mnt/extra-addons' in recipe
     assert 'checkout --detach FETCH_HEAD' in recipe
     assert '--branch' not in recipe
