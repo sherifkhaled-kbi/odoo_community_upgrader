@@ -1209,6 +1209,13 @@ USER odoo
                                 saved_hash != self.job.data['config'].get('addons_sha256')):
                             raise RecoveryError('ADDONS_CHANGED: retained custom addons changed')
                         self.extra_addons = str(addon)
+                    elif self.extra_addons:
+                        # First time this job is given extra addons; adopt and retain them like a fresh job would.
+                        self.process_extra_addons()
+                        shutil.copytree(self.custom_addons_dir, addon)
+                        self.job.data['config'].update(extra_addons=True, addons_sha256=hashlib.sha256(
+                            json.dumps(inventory(self.custom_addons_dir), sort_keys=True).encode()).hexdigest())
+                        self.job.save()
                     current = self._reuse_workspace()
                 else:
                     if self.single_copy and snapshot and snapshot[1]['version'] == self.target_version:
@@ -1220,19 +1227,21 @@ USER odoo
                         console.print('Independent restore verification was not run for this ZIP checkpoint.')
                         return str(artifact)
                     self._stage('INPUT_PREPARATION')
-                    if resume:
-                        addon = self.job.path / 'inputs' / 'custom_addons'
-                        self.extra_addons = str(addon) if addon.exists() else None
-                        if addon.exists():
-                            current_hash = hashlib.sha256(json.dumps(inventory(addon), sort_keys=True).encode()).hexdigest()
-                            if current_hash != self.job.data['config'].get('addons_sha256'):
-                                raise RecoveryError('ADDONS_CHANGED: retained source bundle is corrupt or modified')
-                    else:
+                    addon = self.job.path / 'inputs' / 'custom_addons'
+                    if resume and addon.exists():
+                        self.extra_addons = str(addon)
+                        current_hash = hashlib.sha256(json.dumps(inventory(addon), sort_keys=True).encode()).hexdigest()
+                        if current_hash != self.job.data['config'].get('addons_sha256'):
+                            raise RecoveryError('ADDONS_CHANGED: retained source bundle is corrupt or modified')
+                    elif not resume:
                         self.validate_source_accessibility()
+                    # else: resuming a job that never had extra addons; a newly supplied
+                    # self.extra_addons (if any) is adopted below, same as a fresh job.
                     self.process_extra_addons()
-                    if not resume and self.extra_addons:
-                        shutil.copytree(self.custom_addons_dir, self.job.path / 'inputs' / 'custom_addons')
-                        self.job.data['config']['addons_sha256'] = hashlib.sha256(json.dumps(inventory(self.custom_addons_dir), sort_keys=True).encode()).hexdigest()
+                    if self.extra_addons and not addon.exists():
+                        shutil.copytree(self.custom_addons_dir, addon)
+                        self.job.data['config'].update(extra_addons=True, addons_sha256=hashlib.sha256(
+                            json.dumps(inventory(self.custom_addons_dir), sort_keys=True).encode()).hexdigest())
                         self.job.save()
                     preflight_version = snapshot[1]['version'] if snapshot else self.source_version_hint
                     source_image_id = self._normal_image(preflight_version) if preflight_version and not snapshot else None

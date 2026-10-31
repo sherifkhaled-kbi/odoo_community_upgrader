@@ -193,17 +193,20 @@ def storage(options, job_id):
 @click.option('--reason', help='Required explanation for an accepted pending runtime correction')
 @click.option('--skip-missing-modules-check', is_flag=True,
               help='Skip the preflight check for installed modules missing from addons-path (unsafe; the upgrade may still fail)')
+@click.option('--extra-addons', help="Custom addons folder, ZIP or URL; only usable if this job has none yet")
 @click.pass_obj
-def resume(options, job_id, dry_run, openupgrade_revision, accept_runtime_change, reason, skip_missing_modules_check):
+def resume(options, job_id, dry_run, openupgrade_revision, accept_runtime_change, reason, skip_missing_modules_check, extra_addons):
     """Reuse a verified pre-migration workspace or restore the latest ZIP checkpoint."""
     try:
         job = Job(options['jobs_dir'], job_id)
+        if extra_addons and job.data['config'].get('extra_addons'):
+            raise click.UsageError('This job already has retained extra addons; --extra-addons cannot replace them on resume')
         overrides = dict(options['revisions'])
         overrides.update(revisions(openupgrade_revision))
         if skip_missing_modules_check:
             logging.getLogger('odooupgrader').warning(
                 '--skip-missing-modules-check is set: the missing-module preflight will be skipped')
-        upgrader = OdooUpgrader('', job.data['target'], verbose=options['verbose'],
+        upgrader = OdooUpgrader('', job.data['target'], extra_addons=extra_addons, verbose=options['verbose'],
             postgres_version=job.data['postgres'], jobs_dir=options['jobs_dir'], job_id=job_id,
             revisions=overrides, acceptance=accept_runtime_change, reason=reason,
             skip_missing_modules_check=skip_missing_modules_check)
