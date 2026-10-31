@@ -66,7 +66,7 @@ def test_source_server_16_dump_client_17_requires_17_and_is_not_rewritten(tmp_pa
     assert path.read_text() == data
 
 
-@pytest.mark.parametrize('archive,exporter,selected', [((1, 14, 0), '13.19', '13'), ((1, 15, 0), '16.4', '16'), ((1, 16, 0), '17.2', '17')])
+@pytest.mark.parametrize('archive,exporter,selected', [((1, 14, 0), '13.19', '13'), ((1, 15, 0), '16.4', '16'), ((1, 16, 0), '17.2', '17'), ((1, 16, 0), '18.6', '18')])
 def test_custom_metadata_uses_exporter_version_not_archive_minor(tmp_path, archive, exporter, selected):
     path = tmp_path / 'custom.dump'
     path.write_bytes(custom_dump(source='12.9', exporter=exporter, archive=archive))
@@ -94,12 +94,61 @@ def test_no_transaction_timeout_does_not_make_downgrade_safe(tmp_path):
 
 def test_newer_source_and_unsupported_runtime_rejected(tmp_path):
     path = tmp_path / 'input'
-    path.write_text(sql_dump('18.1', '18.1'))
-    with pytest.raises(RestoreFailure, match='supports 13–17'):
+    path.write_text(sql_dump('19.1', '19.1'))
+    with pytest.raises(RestoreFailure, match='supports 13–18'):
         select_runtime('auto', inspect_dump(path))
-    path.write_text(sql_dump('16.4', '17.2'))
+    path.write_text(sql_dump('16.13', '18.6'))
+    assert select_runtime('auto', inspect_dump(path)) == '18'
     with pytest.raises(RestoreFailure):
-        select_runtime('18', inspect_dump(path))
+        select_runtime('17', inspect_dump(path))
+    validate_runtime(inspect_dump(path), runtime(18), '18')
+
+
+def test_postgres_18_uses_new_docker_volume_target(upgrader):
+    upgrader.pg_selected = '18'
+    upgrader.create_db_compose_file()
+    compose = json.loads((Path(upgrader.cwd) / 'db-composer.yml').read_text())
+    assert compose['services']['db-odooupgrade']['image'] == 'postgres:18'
+    assert compose['services']['db-odooupgrade']['volumes'] == ['postgres_data:/var/lib/postgresql']
+
+
+def test_pg_data_volume_path_matches_selected_major(upgrader):
+    upgrader.pg_selected = '17'
+    assert upgrader._pg_data_volume_path() == '/var/lib/postgresql/data'
+    upgrader.pg_selected = '18'
+    assert upgrader._pg_data_volume_path() == '/var/lib/postgresql'
+
+
+def test_capacity_check_targets_postgres18_data_mount(upgrader):
+    """PostgreSQL 18 has no /var/lib/postgresql/data; a hardcoded 13-17 path would
+    make every checkpoint capacity check on PG18 fail with ENOENT from `df`."""
+    upgrader.pg_selected = '18'
+    upgrader._sql = lambda query, **kwargs: '1000'
+    (Path(upgrader.filestore_dir)).mkdir(parents=True, exist_ok=True)
+    calls = []
+    def command(cmd, **kwargs):
+        calls.append(cmd)
+        return SimpleNamespace(stdout='Filesystem 1K-blocks Used Available Capacity Mounted\n'
+                               '/dev/x 100 1 999999999 1% /var/lib/postgresql\n')
+    upgrader._run_cmd = command
+    upgrader._capacity()
+    df_call = next(c for c in calls if c[:2] == ['docker', 'exec'] and 'df' in c)
+    assert df_call[-1] == '/var/lib/postgresql'
+
+
+def test_restore_storage_snapshot_targets_postgres18_data_mount(upgrader):
+    upgrader.pg_selected = '18'
+    calls = []
+    def command(cmd, **kwargs):
+        calls.append(cmd)
+        header = 'Filesystem 1K-blocks Used Available Capacity Mounted\n'
+        return SimpleNamespace(stdout=header + '\n'.join(
+            f'/dev/x 100 1 999999999 1% {path}' for path in ('/var/lib/postgresql', '/tmp', '/dev/shm')))
+    upgrader._run_cmd = command
+    usage = upgrader._restore_storage_snapshot()
+    assert usage['available'] is True
+    assert '/var/lib/postgresql' in calls[0]
+    assert '/var/lib/postgresql/data' not in calls[0]
 
 
 def test_actual_server_and_both_clients_checked(tmp_path):

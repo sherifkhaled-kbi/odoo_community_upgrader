@@ -14,7 +14,7 @@ import uuid
 import zipfile
 
 from .checks import FACTOR_FIX_SCRIPT_SHA256, LIBRARY_REVISION, OPENUPGRADE_REVISIONS, extract_zip, validate_uom, verify_attachments
-from .diagnostics import RedactionFilter, collect
+from .diagnostics import RedactionFilter, collect, redact
 from .jobs import Job, RecoveryError, atomic_json, digest, inventory, require_space, sync_dir
 from .postgres_restore import (RestoreFailure, inspect_dump, select_runtime, validate_runtime, client_version, version_number, sql_failure_evidence)
 
@@ -146,6 +146,8 @@ class RecoveryMixin:
                 info = self._inspect_owned(name, attempt['id'])
                 if info and info['State']['Running']:
                     subprocess.run(['docker', 'stop', info['Id']], check=True, capture_output=True, timeout=30)
+            except RecoveryError:
+                raise
             except Exception as exc:
                 errors.append((name, exc))
         if errors:
@@ -221,8 +223,15 @@ class RecoveryMixin:
         attached = json.loads(network.stdout)[0].get('Containers') or {}
         if any(container_id != info['Id'] for container_id in attached):
             raise RecoveryError('WORKSPACE_INVALID: unexpected container is attached to the private network')
+        # A stopped migration/verify container from an already-checkpointed transition
+        # earlier in this same attempt is retained evidence, not an active writer: the
+        # network-attachment check above already proves nothing is currently connected.
+        # Only a container that is still RUNNING indicates an unresolved writer.
         for name in self.attempt['containers']:
-            if name != self.db_container and self._inspect_owned(name, self.attempt['id']):
+            if name == self.db_container:
+                continue
+            info = self._inspect_owned(name, self.attempt['id'])
+            if info and info['State']['Running']:
                 raise RecoveryError('WORKSPACE_INVALID: migration container exists; restore a checkpoint')
         if self._filestore_fingerprint() != ready['filestore_sha256']:
             raise RecoveryError('WORKSPACE_INVALID: filestore changed; restore a checkpoint')
@@ -241,12 +250,21 @@ class RecoveryMixin:
         for directory in (self.source_dir, self.output_dir, self.filestore_dir, self.custom_addons_dir):
             Path(directory).mkdir(parents=True, exist_ok=True, mode=0o700)
 
+    def _pg_data_volume_path(self):
+        """PostgreSQL 18's official image mounts the named volume at /var/lib/postgresql;
+        13-17 mount it at /var/lib/postgresql/data. Used for both the Compose volume
+        target and in-container capacity checks, so both stay in sync with the
+        actually selected restore runtime."""
+        selected = self.pg_selected or self.postgres_version
+        return '/var/lib/postgresql' if int(selected.split('.')[0]) >= 18 else '/var/lib/postgresql/data'
+
     def create_db_compose_file(self):
         labels = {'odooupgrader.job': self.job.id, 'odooupgrader.attempt': self.attempt['id']}
+        selected = self.pg_selected or self.postgres_version
         compose = {'services': {'db-odooupgrade': {
-            'container_name': self.db_container, 'image': 'postgres:' + (self.pg_selected or self.postgres_version),
+            'container_name': self.db_container, 'image': 'postgres:' + selected,
             'labels': labels, 'environment': {'POSTGRES_DB': 'odoo', 'POSTGRES_USER': 'odoo', 'POSTGRES_PASSWORD': 'odoo'},
-            'networks': ['migration'], 'volumes': ['postgres_data:/var/lib/postgresql/data'], 'restart': 'no'}},
+            'networks': ['migration'], 'volumes': ['postgres_data:' + self._pg_data_volume_path()], 'restart': 'no'}},
             'networks': {'migration': {'name': self.network, 'internal': True}},
             'volumes': {'postgres_data': {'labels': labels}}}
         atomic_json(Path(self.cwd) / 'db-composer.yml', compose)
@@ -346,7 +364,7 @@ class RecoveryMixin:
     def _restore_storage_snapshot(self):
         """Read numeric capacity only, without SQL or customer/file contents."""
         roles = ('postgres_data', 'container_tmp', 'shared_memory')
-        paths = ('/var/lib/postgresql/data', '/tmp', '/dev/shm')
+        paths = (self._pg_data_volume_path(), '/tmp', '/dev/shm')
         try:
             blocks = self._run_cmd(['docker', 'exec', self.db_container, 'df', '-Pk', *paths],
                                    capture_output=True, timeout=10).stdout.splitlines()[1:]
@@ -502,7 +520,21 @@ class RecoveryMixin:
             except OSError:
                 logger.warning('Restored ZIP input could not be removed from the working directory')
 
-    def _technical(self, expected, filestore, database='database'):
+    def _unaccounted_missing_modules(self, missing, installed, module_mapping):
+        """Resolve each missing module through OpenUpgrade's own apriori rename/merge
+        chain; only a module whose chain ends outside the installed set is unaccounted
+        for. This recognizes upstream-documented changes, never a guessed mapping."""
+        unaccounted = set()
+        for name in missing:
+            seen, current = set(), name
+            while current in module_mapping and current not in seen:
+                seen.add(current)
+                current = module_mapping[current]
+            if current not in installed:
+                unaccounted.add(name)
+        return unaccounted
+
+    def _technical(self, expected, filestore, database='database', module_mapping=None):
         modules = self._rows('SELECT name, state, latest_version FROM ir_module_module ORDER BY name', database)
         base = [m for m in modules if m['name'] == 'base' and m['state'] == 'installed']
         if len(base) != 1 or base[0]['latest_version'].split('.')[0] != expected.split('.')[0]:
@@ -510,8 +542,12 @@ class RecoveryMixin:
         if any(m['state'] in ('to install', 'to upgrade', 'to remove') for m in modules):
             raise RecoveryError('MODULE_PENDING: unexpected pending module states')
         installed = {m['name'] for m in modules if m['state'] == 'installed'}
-        if set(self.module_baseline) - installed:
-            raise RecoveryError('MODULE_MISSING: installed module disappeared; review upstream rename/merge mapping')
+        missing = set(self.module_baseline) - installed
+        if missing:
+            missing = self._unaccounted_missing_modules(missing, installed, module_mapping or {})
+        if missing:
+            raise RecoveryError('MODULE_MISSING: installed module(s) disappeared with no upstream rename/merge '
+                                'evidence; review protected diagnostics: ' + ', '.join(sorted(missing)))
         if self._sql("SELECT count(*) FROM ir_config_parameter WHERE key='base.partially_updated_database'", database) != '0':
             raise RecoveryError('PARTIAL_DATABASE: registry startup forbidden on partial migration')
         if self._sql('SELECT count(*) FROM pg_constraint WHERE NOT convalidated', database) != '0':
@@ -537,7 +573,7 @@ class RecoveryMixin:
         fs_bytes = sum(x['size'] for x in inventory(self.filestore_dir).values())
         # Dump+copy+verification+artifact headroom, measured again at every boundary.
         require_space(self.cwd, 3 * db_bytes + 3 * fs_bytes)
-        output = self._run_cmd(['docker', 'exec', self.db_container, 'df', '-Pk', '/var/lib/postgresql/data'], capture_output=True).stdout
+        output = self._run_cmd(['docker', 'exec', self.db_container, 'df', '-Pk', self._pg_data_volume_path()], capture_output=True).stdout
         available = int(output.splitlines()[-1].split()[3]) * 1024
         if available < 2 * db_bytes + 256 * 1024**2:
             raise RecoveryError('DISK_SPACE: PostgreSQL volume lacks verification/restore headroom')
@@ -587,7 +623,7 @@ class RecoveryMixin:
     def _checkpoint(self, major, runtime):
         self.job.stage('CHECKPOINTING')
         self._capacity()
-        result = self._technical(major, self.filestore_dir)
+        result = self._technical(major, self.filestore_dir, module_mapping=runtime.get('module_mapping'))
         if major == '19.0' and self.uom_baseline is not None:
             from .checks import verify_uom_ratios
             verify_uom_ratios(self.uom_baseline, self._rows('SELECT id, factor FROM uom_uom ORDER BY id'))
@@ -610,9 +646,9 @@ class RecoveryMixin:
         original = None
         try:
             self._restore_dump(dump, database)
-            self._technical(major, verify_fs, database)
+            self._technical(major, verify_fs, database, module_mapping=runtime.get('module_mapping'))
             self._probe(database, verify_fs, runtime['image_id'])
-            self._technical(major, verify_fs, database)
+            self._technical(major, verify_fs, database, module_mapping=runtime.get('module_mapping'))
         except BaseException as exc:
             original = exc
             raise
@@ -647,6 +683,34 @@ class RecoveryMixin:
         locks[target] = runtime
         del candidates[target]
         self.job.save()
+
+    def _pip_check_violations(self, image_ref):
+        """Return sorted, deduplicated `pip check` broken-requirement lines for an image.
+
+        Metadata WARNING lines (e.g. malformed dist-info shipped by upstream apt packages)
+        are informational, not a dependency conflict, and are excluded.
+        """
+        result = self._run_cmd(['docker', 'run', '--rm', '--network', 'none', '--entrypoint', 'python3',
+                                image_ref, '-m', 'pip', 'check'], check=False, capture_output=True)
+        if result.returncode not in (0, 1):
+            raise RecoveryError(f'DEPENDENCY_PROBE_FAILED: could not run pip check in {image_ref} '
+                                f'(exit {result.returncode}): {redact((result.stderr or "")[-4096:])}')
+        lines = (result.stdout or '').splitlines() + (result.stderr or '').splitlines()
+        return sorted({line.strip() for line in lines if line.strip() and not line.startswith('WARNING:')})
+
+    def _dependency_conflicts(self, base_image, built_image_id):
+        """Diff `pip check` violations between the untouched base image and the built one.
+
+        Odoo's official base images ship with pre-existing, upstream-caused dependency
+        mismatches (e.g. maxminddb/setuptools) unrelated to OpenUpgrade or custom addons.
+        Only conflicts newly introduced by this build's own installs are fatal; conflicts
+        already present in the pristine base image are reported but never block migration.
+        """
+        baseline = self._pip_check_violations(base_image)
+        final = self._pip_check_violations(built_image_id)
+        new_conflicts = [line for line in final if line not in baseline]
+        preexisting = [line for line in final if line in baseline]
+        return new_conflicts, preexisting
 
     def _prepare_migration_image(self, target_version):
         """Build and probe a pinned image without touching the working database."""
@@ -686,21 +750,48 @@ USER odoo
         self.job.stage('BUILDING_' + target_version)
         self._run_cmd(['docker', 'build', '-t', image, str(build)], capture_output=True)
         image_id = self._run_cmd(['docker', 'image', 'inspect', image, '--format={{.Id}}'], capture_output=True).stdout.strip()
-        probe = "import json,importlib.metadata as m; from openupgradelib import openupgrade; "
+        # Odoo 19's official image packages `odoo` as a namespace package (no
+        # __init__.py), so a bare `import odoo` never populates odoo.fields/api the
+        # way 17/18's regular package does. openupgradelib's top-level code reads
+        # core.fields/core.api at import time and crashes with a bare import. Real
+        # Odoo startup always imports the `base` addon (every module depends on it)
+        # before loading openupgrade_framework, which populates these attributes as
+        # a side effect; importing it here first makes this probe reflect that same
+        # order instead of a standalone-script artifact.
+        probe = "import odoo.addons.base; import json,importlib,importlib.metadata as m,sys; from openupgradelib import openupgrade; "
         if target_version == '18.0':
             probe += "assert callable(openupgrade.add_inherits_parent_xmlids); "
         probe += f"assert json.loads(m.distribution('openupgradelib').read_text('direct_url.json'))['vcs_info']['commit_id'] == '{LIBRARY_REVISION}'; "
+        # OCA's own apriori.py is the upstream-maintained module rename/merge registry
+        # (e.g. account_payment_term -> account); absence/import failure degrades to an
+        # empty mapping rather than blocking the build, since it is evidence, not a gate.
+        probe += ("sys.path.insert(0, '/mnt/extra-addons')\n"
+                  "try:\n"
+                  "    _apriori = importlib.import_module('openupgrade_scripts.apriori')\n"
+                  "    module_mapping = dict(getattr(_apriori, 'renamed_modules', {}))\n"
+                  "    module_mapping.update(getattr(_apriori, 'merged_modules', {}))\n"
+                  "except Exception:\n"
+                  "    module_mapping = {}\n")
         probe += ("packages=[(d.metadata.get('Name') or '<unnamed>', d.metadata.get('Version') or '<unknown-version>') for d in m.distributions()]; "
                   "print(json.dumps({'python':__import__('platform').python_version(),'dependencies':sorted(packages),"
                   "'incomplete_distribution_count':sum(name == '<unnamed>' or version == '<unknown-version>' for name,version in packages),"
-                  "'library':json.loads(m.distribution('openupgradelib').read_text('direct_url.json')).get('vcs_info')}))")
+                  "'library':json.loads(m.distribution('openupgradelib').read_text('direct_url.json')).get('vcs_info'),"
+                  "'module_mapping':module_mapping}))")
         env = json.loads(self._run_cmd(['docker', 'run', '--rm', '--network', 'none', '--entrypoint', 'python3', image_id, '-c', probe], capture_output=True).stdout)
         if env['incomplete_distribution_count']:
             logger.warning('%s Python distributions lack Name/Version metadata; placeholders recorded in runtime inventory',
                            env['incomplete_distribution_count'])
-        self._run_cmd(['docker', 'run', '--rm', '--network', 'none', '--entrypoint', 'python3', image_id, '-m', 'pip', 'check'], capture_output=True)
+        new_conflicts, preexisting_conflicts = self._dependency_conflicts('odoo:' + target_version, image_id)
+        if new_conflicts:
+            raise RecoveryError('DEPENDENCY_ERROR: OpenUpgrade/custom-addon requirements introduced new package '
+                                'conflicts not present in the base odoo:' + target_version + ' image: ' + '; '.join(new_conflicts))
+        if preexisting_conflicts:
+            logger.warning('Ignoring %d dependency conflict(s) already present in the unmodified base odoo:%s image '
+                           '(not introduced by this build): %s', len(preexisting_conflicts), target_version,
+                           '; '.join(preexisting_conflicts))
         prepared = {'revision': revision, 'image_id': image_id, 'environment': env,
-                    'application_fingerprint': fingerprint, 'addons_sha256': addons_sha256}
+                    'application_fingerprint': fingerprint, 'addons_sha256': addons_sha256,
+                    'preexisting_dependency_conflicts': preexisting_conflicts}
         self.attempt['prebuilt_images'][target_version] = prepared
         self.job.save()
         return prepared
@@ -714,6 +805,9 @@ USER odoo
             'image_id': image_id, 'odoo_revision': None, 'odoo_revision_note': 'Official image has no verified Git provenance',
             'application_fingerprint': prepared['application_fingerprint'],
             'postgres': self._sql('SHOW server_version'), 'environment': prepared['environment']}
+        # OCA's own apriori registry for this exact pinned revision; used only to recognize
+        # an upstream-documented rename/merge, never to invent or guess a mapping.
+        self.current_runtime['module_mapping'] = prepared['environment'].get('module_mapping', {})
         self.current_runtime['addons_sha256'] = self.job.data['config'].get('addons_sha256')
         self.current_runtime['application_commit'] = self._runtime_plan()['application_commit']
         self.attempt['runtime'][target_version] = self.current_runtime
@@ -833,7 +927,7 @@ USER odoo
         self.job.stage('CHECKPOINTING')
         self._single_copy_capacity()
         self._probe('database', self.filestore_dir, self.current_runtime['image_id'])
-        validation = self._technical(version, self.filestore_dir)
+        validation = self._technical(version, self.filestore_dir, module_mapping=self.current_runtime.get('module_mapping'))
         if version == '19.0' and self.uom_baseline is not None:
             from .checks import verify_uom_ratios
             verify_uom_ratios(self.uom_baseline, self._rows('SELECT id, factor FROM uom_uom ORDER BY id'))

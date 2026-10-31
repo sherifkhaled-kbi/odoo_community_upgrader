@@ -31,6 +31,10 @@ class FixtureUpgrader(OdooUpgrader):
     def _stop_attempt(self, attempt):
         pass
 
+    def _prepare_migration_image(self, target_version):
+        return {'revision': 'fixture', 'image_id': 'fixture-image-' + target_version,
+                'environment': {}, 'application_fingerprint': 'fixture', 'addons_sha256': None}
+
     def wait_for_db(self):
         pass
 

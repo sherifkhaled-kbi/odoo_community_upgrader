@@ -10,7 +10,7 @@ import re
 
 from .jobs import RecoveryError
 
-SUPPORTED_MAJORS = range(13, 18)
+SUPPORTED_MAJORS = range(13, 19)
 HEADER_LIMIT = 256 * 1024
 
 
@@ -119,14 +119,14 @@ def required_major(metadata):
 def select_runtime(requested, metadata):
     required = required_major(metadata)
     if required not in SUPPORTED_MAJORS:
-        fail('UNSUPPORTED_POSTGRES_VERSION', f'dump requires PostgreSQL {required}+; this restore adapter supports 13–17. Retain the original and qualify a newer runtime')
+        fail('UNSUPPORTED_POSTGRES_VERSION', f'dump requires PostgreSQL {required}+; this restore adapter supports 13–18. Retain the original and qualify a newer runtime')
     if requested == 'auto':
         return str(required)
     if not re.fullmatch(r'\d+(?:\.\d+)*', requested):
         fail('INVALID_POSTGRES_VERSION', 'use --postgres-version auto or a supported numeric version')
     major = int(requested.split('.')[0])
     if major not in SUPPORTED_MAJORS:
-        fail('UNSUPPORTED_POSTGRES_VERSION', 'supported restore runtimes are PostgreSQL 13–17')
+        fail('UNSUPPORTED_POSTGRES_VERSION', 'supported restore runtimes are PostgreSQL 13–18')
     if major < required:
         fail('POSTGRES_VERSION_MISMATCH',
              f'dump requires PostgreSQL {required}+ (server {metadata["source_server_version"]}, pg_dump {metadata["dump_client_version"]}); requested {requested}. Start a new job with --postgres-version auto or {required}; do not edit the dump')

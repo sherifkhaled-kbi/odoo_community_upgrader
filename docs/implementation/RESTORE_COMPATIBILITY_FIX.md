@@ -1,5 +1,11 @@
 # PostgreSQL restore compatibility correction
 
+## PostgreSQL 18 extension (2026-10-31)
+
+A later backup reported source server 16.13 but `pg_dump` 18.6 and `SET transaction_timeout = 0;`. The producing client version determines the minimum restore major, so `auto` now selects PostgreSQL 18 for this input. The adapter admits 13–18 and still checks the actual server, `psql`, `pg_restore` and image identity before restore. It does not edit the SQL. The [PostgreSQL 18 pg_dump documentation](https://www.postgresql.org/docs/18/app-pgdump.html) explains why newer dumps are not guaranteed to load into older servers.
+
+The [official PostgreSQL Docker image documentation](https://hub.docker.com/_/postgres) changes `PGDATA` to `/var/lib/postgresql/18/docker` and the volume target to `/var/lib/postgresql` for 18. Compose mount and capacity inspection use that target for 18; the 13–17 target remains `/var/lib/postgresql/data`. The original support and test results below describe the earlier 13–17 release. PostgreSQL 18 restore and full Odoo migration have not been exercised against this customer backup in the development workspace.
+
 ## Root cause established before editing
 
 Baseline repository: application commit `96234b3` (`resolve`). The original `RecoveryMixin.create_db_compose_file()` used `postgres:<self.postgres_version>` without inspecting the backup. CLI default was 13; the operator confirmed **16** for this failed job. The image's exact remote patch version/digest was not supplied and was not invented.

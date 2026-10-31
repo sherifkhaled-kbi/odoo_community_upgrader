@@ -8,7 +8,7 @@ from click.testing import CliRunner
 from odooupgrader.cli import main
 from odooupgrader.core import OdooUpgrader
 from odooupgrader.jobs import Job, RecoveryError
-from odooupgrader.checks import verify_uom_ratios
+from odooupgrader.checks import LIBRARY_REVISION, verify_uom_ratios
 
 
 @pytest.fixture
@@ -119,6 +119,44 @@ def test_partial_db_never_initializes_registry(upgrader):
         upgrader._technical('19.0', upgrader.filestore_dir)
 
 
+def test_unaccounted_missing_modules_follows_rename_chain_and_detects_cycles(upgrader):
+    mapping = {'a': 'b', 'b': 'c'}
+    assert upgrader._unaccounted_missing_modules({'a'}, {'c'}, mapping) == set()
+    assert upgrader._unaccounted_missing_modules({'a'}, {'b'}, mapping) == {'a'}
+    cyclic = {'x': 'y', 'y': 'x'}
+    assert upgrader._unaccounted_missing_modules({'x'}, set(), cyclic) == {'x'}
+
+
+def test_module_merge_mapping_resolves_known_upstream_disappearance(upgrader):
+    """Real Odoo 17->18 evidence: OCA's apriori.py merges account_payment_term into
+    account; a hard MODULE_MISSING block here would fail every real-world Accounting
+    migration. The mapping must come from OpenUpgrade's own registry, never a guess."""
+    upgrader.module_baseline = ['base', 'account', 'account_payment_term']
+    upgrader._rows = lambda query, database='database': (
+        [{'name': 'base', 'state': 'installed', 'latest_version': '18.0.1.3'},
+         {'name': 'account', 'state': 'installed', 'latest_version': '18.0.1.3'}]
+        if 'ir_module_module' in query else [])
+    upgrader._sql = lambda query, database='database': '0'
+    with pytest.raises(RecoveryError, match='MODULE_MISSING') as error:
+        upgrader._technical('18.0', upgrader.filestore_dir)
+    assert 'account_payment_term' in str(error.value)
+    result = upgrader._technical('18.0', upgrader.filestore_dir, module_mapping={'account_payment_term': 'account'})
+    assert result['passed'] is True
+
+
+def test_module_mapping_does_not_waive_an_unmapped_or_dangling_disappearance(upgrader):
+    upgrader.module_baseline = ['base', 'sale_commission']
+    upgrader._rows = lambda query, database='database': (
+        [{'name': 'base', 'state': 'installed', 'latest_version': '18.0.1.3'}]
+        if 'ir_module_module' in query else [])
+    upgrader._sql = lambda query, database='database': '0'
+    with pytest.raises(RecoveryError, match='MODULE_MISSING'):
+        upgrader._technical('18.0', upgrader.filestore_dir)
+    # A mapping exists, but its merge target was itself never installed: still fatal.
+    with pytest.raises(RecoveryError, match='sale_commission'):
+        upgrader._technical('18.0', upgrader.filestore_dir, module_mapping={'sale_commission': 'sale_commission_oca'})
+
+
 def test_migration_build_dependency_error_prevents_container_execution(upgrader):
     upgrader._uom_preflight = lambda target: None
     calls = []
@@ -133,9 +171,129 @@ def test_migration_build_dependency_error_prevents_container_execution(upgrader)
     assert len(calls) == 1
     recipe = (Path(upgrader.cwd) / 'build' / '18.0' / 'Dockerfile').read_text()
     assert '565d0b33391271a4b2ac27eff8ae19f72fe27d77' in recipe
-    assert 'git checkout --detach' in recipe
+    assert 'safe.directory=/mnt/extra-addons' in recipe
+    assert 'checkout --detach FETCH_HEAD' in recipe
     assert '--branch' not in recipe
     assert not list((Path(upgrader.cwd) / 'build').rglob('*.dump'))
+
+
+def _stub_build_and_probe(calls=None):
+    """Fake docker build/inspect/env-probe plumbing shared by dependency-conflict tests."""
+    def command(cmd, **kwargs):
+        if calls is not None:
+            calls.append(cmd)
+        if cmd[:2] == ['docker', 'build']:
+            return SimpleNamespace(returncode=0, stdout='', stderr='')
+        if cmd[:3] == ['docker', 'image', 'inspect']:
+            return SimpleNamespace(returncode=0, stdout='sha256:builtimage\n', stderr='')
+        if '-c' in cmd:
+            env = {'python': '3.12.1', 'dependencies': [], 'incomplete_distribution_count': 0,
+                   'library': {'commit_id': LIBRARY_REVISION}}
+            return SimpleNamespace(returncode=0, stdout=json.dumps(env), stderr='')
+        raise AssertionError(cmd)
+    return command
+
+
+def test_capability_probe_imports_odoo_base_before_openupgradelib(upgrader):
+    """Real evidence: odoo:19.0 packages `odoo` as a namespace package, so a bare
+    `import odoo` never populates odoo.fields/api, and openupgradelib's top-level
+    code reads them immediately on import, raising AttributeError. Real Odoo startup
+    always imports the `base` addon (every module depends on it) before loading
+    openupgrade_framework, which populates these attributes as a side effect; the
+    probe must mirror that order or it fails on 19.0 independent of any real
+    migration defect."""
+    upgrader._uom_preflight = lambda target: None
+    probes = []
+    base_stub = _stub_build_and_probe()
+    def command(cmd, **kwargs):
+        if '-c' in cmd:
+            probes.append(cmd[-1])
+        if cmd[-3:] == ['-m', 'pip', 'check']:
+            return SimpleNamespace(returncode=0, stdout='', stderr='')
+        return base_stub(cmd, **kwargs)
+    upgrader._run_cmd = command
+    upgrader._prepare_migration_image('18.0')
+    assert probes
+    assert probes[0].index('import odoo.addons.base') < probes[0].index('from openupgradelib import openupgrade')
+
+
+def test_preexisting_upstream_dependency_conflict_does_not_block_build(upgrader):
+    """odoo:18.0/19.0 ship with a pre-existing maxminddb/setuptools pip-check conflict
+    unrelated to OpenUpgrade; it must not block every 17->18 or 18->19 migration."""
+    upgrader._uom_preflight = lambda target: None
+    base = _stub_build_and_probe()
+    def command(cmd, **kwargs):
+        if cmd[-3:] == ['-m', 'pip', 'check']:
+            # Same conflict reported for both the pristine base image and the built one.
+            return SimpleNamespace(returncode=1,
+                stdout='maxminddb 2.5.2 has requirement setuptools>=68.2.2, but you have setuptools 68.1.2.\n',
+                stderr="WARNING: Skipping charset_normalizer-3.3.2.dist-info due to invalid metadata entry 'name'\n")
+        return base(cmd, **kwargs)
+    upgrader._run_cmd = command
+    prepared = upgrader._prepare_migration_image('18.0')
+    assert prepared['image_id'] == 'sha256:builtimage'
+    assert prepared['preexisting_dependency_conflicts'] == [
+        'maxminddb 2.5.2 has requirement setuptools>=68.2.2, but you have setuptools 68.1.2.']
+
+
+def test_new_dependency_conflict_introduced_by_build_is_fatal(upgrader):
+    """A conflict absent from the untouched base image but present after our own
+    OpenUpgrade/custom-addon installs must still block migration."""
+    upgrader._uom_preflight = lambda target: None
+    base = _stub_build_and_probe()
+    def command(cmd, **kwargs):
+        if cmd[-3:] == ['-m', 'pip', 'check']:
+            image_ref = cmd[-4]
+            if image_ref == 'odoo:18.0':
+                return SimpleNamespace(returncode=0, stdout='', stderr='')
+            return SimpleNamespace(returncode=1, stdout=
+                'openupgrade-custom 1.0 has requirement six>=2.0, but you have six 1.16.0.\n', stderr='')
+        return base(cmd, **kwargs)
+    upgrader._run_cmd = command
+    with pytest.raises(RecoveryError, match='DEPENDENCY_ERROR'):
+        upgrader._prepare_migration_image('18.0')
+
+
+def test_dependency_probe_infra_failure_is_distinct_from_a_real_conflict(upgrader):
+    upgrader._uom_preflight = lambda target: None
+    base = _stub_build_and_probe()
+    def command(cmd, **kwargs):
+        if cmd[-3:] == ['-m', 'pip', 'check']:
+            return SimpleNamespace(returncode=125, stdout='', stderr='docker: Error response from daemon: No such image')
+        return base(cmd, **kwargs)
+    upgrader._run_cmd = command
+    with pytest.raises(RecoveryError, match='DEPENDENCY_PROBE_FAILED'):
+        upgrader._prepare_migration_image('18.0')
+
+
+def test_reuse_workspace_ignores_stopped_history_but_blocks_a_running_container(upgrader):
+    """Real evidence: a single-copy attempt that already completed one transition
+    always has a stopped (never auto-removed) migration/verify container recorded in
+    attempt['containers']. Treating its mere existence as disqualifying makes
+    pre-migration workspace reuse permanently impossible after the first transition,
+    defeating the documented --single-copy resume feature. Only a currently RUNNING
+    unexpected container is real evidence of an active writer."""
+    upgrader.attempt['containers'] = [upgrader.db_container, 'ou-migrate-stopped', 'ou-verify-stopped']
+    upgrader.attempt['workspace_ready'] = {'version': '18.0', 'db_container_id': 'dbid',
+        'filestore_sha256': 'fshash', 'modules': ['base'], 'runtime': {'image_id': 'sha256:x'}}
+    upgrader._run_cmd = lambda cmd, **kw: SimpleNamespace(stdout=json.dumps([{'Containers': {}}]))
+    upgrader._filestore_fingerprint = lambda: 'fshash'
+    upgrader._technical = lambda version, filestore: {'modules': ['base']}
+    upgrader.wait_for_db = lambda: None
+    def inspect_stopped(name, attempt_id):
+        if name == upgrader.db_container:
+            return {'Id': 'dbid', 'State': {'Running': True}}
+        return {'Id': 'other', 'State': {'Running': False}}
+    upgrader._inspect_owned = inspect_stopped
+    assert upgrader._reuse_workspace() == '18.0'
+
+    def inspect_running(name, attempt_id):
+        if name == upgrader.db_container:
+            return {'Id': 'dbid', 'State': {'Running': True}}
+        return {'Id': 'other', 'State': {'Running': True}}
+    upgrader._inspect_owned = inspect_running
+    with pytest.raises(RecoveryError, match='WORKSPACE_INVALID'):
+        upgrader._reuse_workspace()
 
 
 def test_foreign_container_never_stopped(upgrader, monkeypatch):
@@ -231,6 +389,12 @@ def test_actual_image_capability_probe_guards_18_without_breaking_17(upgrader, m
     module = types.ModuleType('openupgradelib')
     module.openupgrade = SimpleNamespace(**({'add_inherits_parent_xmlids': lambda *a: None} if helper else {}))
     monkeypatch.setitem(sys.modules, 'openupgradelib', module)
+    # Real Odoo 19 images need `odoo.addons.base` imported before openupgradelib to
+    # populate odoo.fields/api (see _prepare_migration_image); fake the module chain
+    # so the real probe string's leading `import odoo.addons.base` succeeds here too.
+    monkeypatch.setitem(sys.modules, 'odoo', types.ModuleType('odoo'))
+    monkeypatch.setitem(sys.modules, 'odoo.addons', types.ModuleType('odoo.addons'))
+    monkeypatch.setitem(sys.modules, 'odoo.addons.base', types.ModuleType('odoo.addons.base'))
     monkeypatch.setattr(importlib.metadata, 'distributions', lambda: [])
     monkeypatch.setattr(importlib.metadata, 'distribution', lambda name: SimpleNamespace(read_text=lambda f: json.dumps({'vcs_info': {'commit_id': LIBRARY_REVISION}})))
     def command(cmd, **kwargs):
@@ -241,6 +405,8 @@ def test_actual_image_capability_probe_guards_18_without_breaking_17(upgrader, m
             return SimpleNamespace(stdout=output.getvalue())
         if cmd[:3] == ['docker', 'image', 'inspect']:
             return SimpleNamespace(stdout='sha256:test')
+        if cmd[-3:] == ['-m', 'pip', 'check']:
+            return SimpleNamespace(returncode=0, stdout='', stderr='')
         return SimpleNamespace(stdout='', stderr='')
     upgrader._run_cmd = command
     upgrader._sql = lambda *a, **k: '13.fixture'

@@ -41,7 +41,7 @@ def execute(upgrader):
 @click.option('--version', type=click.Choice(OdooUpgrader.VALID_VERSIONS), help='Target Odoo version')
 @click.option('--extra-addons', help='Custom addons folder, ZIP or URL')
 @click.option('--verbose', is_flag=True)
-@click.option('--postgres-version', default='13', show_default=True, help='Numeric PostgreSQL version or auto (inspect dump; supported runtimes 13–17)')
+@click.option('--postgres-version', default='13', show_default=True, help='Numeric PostgreSQL version or auto (inspect dump; supported runtimes 13–18)')
 @click.option('--log-file', type=click.Path())
 @click.option('--jobs-dir', type=click.Path(path_type=Path), default=Path('.odooupgrader/jobs'), show_default=True)
 @click.option('--filestore', type=click.Path(exists=True, file_okay=False), help='Matching filestore for a custom-format dump')
@@ -142,9 +142,13 @@ def storage(options, job_id):
                 if (info.get('Labels') or {}).get('odooupgrader.job') != job.id:
                     continue
                 mount = Path(info['Mountpoint'])
+                selected = str(job.data.get('selected_postgres') or job.data['postgres'])
+                wal_path = (mount / selected.split('.')[0] / 'docker' / 'pg_wal'
+                            if selected != 'auto' and int(selected.split('.')[0]) >= 18
+                            else mount / 'pg_wal')
                 try:
                     volumes.append({'name': name, 'allocated_bytes': allocated_bytes(mount),
-                                    'pg_wal_bytes': allocated_bytes(mount / 'pg_wal')})
+                                    'pg_wal_bytes': allocated_bytes(wal_path)})
                 except OSError:
                     volumes.append({'name': name, 'allocated_bytes': None})
         image_ids = set()
