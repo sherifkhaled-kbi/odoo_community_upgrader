@@ -5,6 +5,7 @@ import logging
 import os
 from pathlib import Path
 import re
+import select
 import shutil
 import subprocess
 import sys
@@ -22,8 +23,12 @@ logger = logging.getLogger('odooupgrader')
 
 
 class RecoveryMixin:
+    # Odoo's official Debian-packaged image layout; used only as best-effort preflight evidence.
+    OFFICIAL_ADDONS_PATH = '/usr/lib/python3/dist-packages/odoo/addons'
+
     def _configure_recovery(self, jobs_dir, job_id, revisions, acceptance, reason, filestore,
-                            allow_missing_attachments, single_copy, source_version):
+                            allow_missing_attachments, single_copy, source_version,
+                            skip_missing_modules_check=False):
         self.jobs_dir = Path(jobs_dir or Path.cwd() / '.odooupgrader' / 'jobs').resolve()
         self.job = Job(self.jobs_dir, job_id) if job_id else None
         if self.job and (self.target_version != self.job.data['target'] or self.postgres_version != self.job.data['postgres']):
@@ -41,6 +46,7 @@ class RecoveryMixin:
                             if self.job else single_copy)
         self.source_version_hint = (self.job.data['config'].get('source_version')
                                     if self.job else source_version)
+        self.skip_missing_modules_check = skip_missing_modules_check
         if self.source_version_hint and int(self.source_version_hint.split('.')[0]) > int(self.target_version.split('.')[0]):
             raise RecoveryError('SOURCE_VERSION: source version cannot exceed target version')
         self._handler = None
@@ -153,6 +159,24 @@ class RecoveryMixin:
         if errors:
             names = ', '.join(name for name, _ in errors)
             raise RecoveryError(f'DOCKER_STOP: could not stop or inspect attempt containers: {names}') from errors[0][1]
+
+    @staticmethod
+    def _stage_label(name):
+        fixed = {'INPUT_PREPARATION': '1/6 Prepare', 'RESTORE_PREFLIGHT': '2/6 Restore',
+                 'RESTORING': '2/6 Restore', 'CHECKPOINTING': '6/6 Checkpoint'}
+        if name in fixed:
+            return fixed[name]
+        for prefix, label in (('PREFLIGHT_', '3/6 Preflight'), ('BUILDING_', '4/6 Build'), ('MIGRATING_', '5/6 Migrate')):
+            if name.startswith(prefix):
+                return f'{label} ({name[len(prefix):]})'
+        return None
+
+    def _stage(self, name):
+        self.job.stage(name)
+        label = self._stage_label(name)
+        if label:
+            from .core import console
+            console.print(f'[bold cyan]Stage {label}[/bold cyan]')
 
     def _new_attempt(self):
         attempt = self.job.begin()
@@ -303,7 +327,7 @@ class RecoveryMixin:
             logger.error('Restore evidence could not be persisted; original error preserved')
 
     def _prepare_restore_input(self, snapshot):
-        self.job.stage('RESTORE_PREFLIGHT')
+        self._stage('RESTORE_PREFLIGHT')
         context = {'status': 'PREFLIGHT', 'requested_postgres': self.postgres_version,
                    'role': 'working', 'dump': None, 'runtime': None}
         self.attempt['restore'] = context
@@ -534,6 +558,70 @@ class RecoveryMixin:
                 unaccounted.add(name)
         return unaccounted
 
+    @staticmethod
+    def _scan_manifest_names(path):
+        base = Path(path)
+        if not base.is_dir():
+            return set()
+        return {child.name for child in base.iterdir() if child.is_dir() and (child / '__manifest__.py').is_file()}
+
+    def _image_module_names(self, image_ref, path_in_image):
+        """Best-effort module inventory read via `docker create`/`cp`; never starts the container."""
+        container = None
+        dest = Path(self.cwd) / ('addon-scan-' + uuid.uuid4().hex)
+        try:
+            container = self._run_cmd(['docker', 'create', image_ref], capture_output=True).stdout.strip()
+            result = self._run_cmd(['docker', 'cp', f'{container}:{path_in_image}', str(dest)],
+                                   check=False, capture_output=True)
+            if result.returncode:
+                return set()
+            return self._scan_manifest_names(dest)
+        except Exception:
+            logger.warning('Could not inspect %s for addon modules at %s', image_ref, path_in_image)
+            return set()
+        finally:
+            shutil.rmtree(dest, ignore_errors=True)
+            if container:
+                self._run_cmd(['docker', 'rm', '-f', container], check=False, capture_output=True)
+
+    def _known_addon_names(self, target_version, image_id):
+        names = self._image_module_names('odoo:' + target_version, self.OFFICIAL_ADDONS_PATH)
+        names |= self._image_module_names(image_id, '/mnt/extra-addons')
+        if self.extra_addons:
+            names |= self._scan_manifest_names(self.custom_addons_dir)
+        return names
+
+    def _missing_module_preflight(self, target_version, prepared):
+        """Catch modules the restored database still needs that no addons-path provides,
+        before the long migration container runs (rather than a silent REGISTRY_VALIDATION
+        failure ~20 minutes in)."""
+        rows = self._rows("SELECT name, state, latest_version FROM ir_module_module "
+                          "WHERE state IN ('installed', 'to upgrade', 'to install') ORDER BY name", 'database')
+        mapping = prepared['environment'].get('module_mapping', {})
+        available = self._known_addon_names(target_version, prepared['image_id'])
+        missing = [r for r in rows if r['name'] not in available and r['name'] not in mapping]
+        if not missing:
+            return
+        from .core import console
+        if self.skip_missing_modules_check:
+            logger.warning('Skipping missing-module preflight (--skip-missing-modules-check): %d module(s) '
+                           'not found in addons-path for %s: %s', len(missing), target_version,
+                           ', '.join(r['name'] for r in missing))
+            console.print(f'[yellow]Warning: skipping missing-module check for {len(missing)} module(s) '
+                          f'(--skip-missing-modules-check)[/yellow]')
+            return
+        console.print(f'[bold red]{len(missing)} module(s) installed in the database are missing from the '
+                     f'addons-path for {target_version}; the upgrade would fail:[/bold red]')
+        console.print(f'{"name":<40}{"state":<14}version')
+        for row in missing:
+            console.print(f"{row['name']:<40}{row['state']:<14}{row['latest_version']}")
+        console.print(f'[yellow]Provide their code via --extra-addons for {target_version}, or pass '
+                     f'--skip-missing-modules-check to override.[/yellow]')
+        self.attempt['missing_modules'] = [{'name': r['name'], 'state': r['state'], 'version': r['latest_version']} for r in missing]
+        self.job.save()
+        raise RecoveryError('REGISTRY_VALIDATION: missing module(s) not found in addons-path for ' + target_version +
+                            ': ' + ', '.join(r['name'] for r in missing))
+
     def _technical(self, expected, filestore, database='database', module_mapping=None):
         modules = self._rows('SELECT name, state, latest_version FROM ir_module_module ORDER BY name', database)
         base = [m for m in modules if m['name'] == 'base' and m['state'] == 'installed']
@@ -621,7 +709,7 @@ class RecoveryMixin:
             raise RecoveryError('REGISTRY_VALIDATION: no successful registry initialization evidence')
 
     def _checkpoint(self, major, runtime):
-        self.job.stage('CHECKPOINTING')
+        self._stage('CHECKPOINTING')
         self._capacity()
         result = self._technical(major, self.filestore_dir, module_mapping=runtime.get('module_mapping'))
         if major == '19.0' and self.uom_baseline is not None:
@@ -747,7 +835,7 @@ USER odoo
         (build / 'Dockerfile').write_text(recipe)
         name = 'ou-migrate-' + self.attempt['id'].replace('-', '') + '-' + target_version.replace('.', '-')
         image = name + ':local'
-        self.job.stage('BUILDING_' + target_version)
+        self._stage('BUILDING_' + target_version)
         self._run_cmd(['docker', 'build', '-t', image, str(build)], capture_output=True)
         image_id = self._run_cmd(['docker', 'image', 'inspect', image, '--format={{.Id}}'], capture_output=True).stdout.strip()
         # Odoo 19's official image packages `odoo` as a namespace package (no
@@ -796,10 +884,110 @@ USER odoo
         self.job.save()
         return prepared
 
+    LOADING_MODULE_RE = re.compile(r"Loading module ([\w.]+) \((\d+)/(\d+)\)")
+    REGISTRY_LOADED_RE = re.compile(r"Registry loaded in ([\d.]+)s")
+
+    @classmethod
+    def _parse_progress_line(cls, line):
+        match = cls.LOADING_MODULE_RE.search(line)
+        if match:
+            return {'name': match.group(1), 'i': int(match.group(2)), 'n': int(match.group(3))}
+        if 'Modules loaded.' in line:
+            return {'stage': 'Modules loaded.'}
+        match = cls.REGISTRY_LOADED_RE.search(line)
+        if match:
+            return {'stage': 'Registry loaded in ' + match.group(1) + 's'}
+        return None
+
+    @staticmethod
+    def _heartbeat_due(now, last_output, last_warned, threshold=120):
+        return now - last_output >= threshold and now - last_warned >= threshold
+
+    @staticmethod
+    def _format_duration(seconds):
+        seconds = max(0, int(seconds))
+        return f'{seconds // 3600:02d}:{seconds % 3600 // 60:02d}:{seconds % 60:02d}'
+
+    def _progress_text(self, transition, progress, elapsed, since_output):
+        if progress.get('n'):
+            percent = round(progress['i'] * 100 / progress['n'])
+            detail = f"Module {progress['i']}/{progress['n']} '{progress['name']}' ({percent}%)"
+        else:
+            detail = progress.get('stage', 'Starting...')
+        return (f'[{transition}] {detail} | elapsed {self._format_duration(elapsed)} '
+                f'| last output {int(since_output)}s ago')
+
+    def _container_health(self, name):
+        try:
+            info = self._inspect_owned(name, self.attempt['id'])
+            state = info['State']['Status'] if info else 'unknown'
+        except Exception:
+            state = 'unknown'
+        try:
+            cpu = self._run_cmd(['docker', 'stats', '--no-stream', '--format', '{{.CPUPerc}}', name],
+                                check=False, capture_output=True, timeout=10).stdout.strip() or 'unknown'
+        except Exception:
+            cpu = 'unknown'
+        return state, cpu
+
+    def _run_upgrade_container(self, command, name, target_version):
+        """Follow the migration container's output live; never kill it on silence."""
+        from .core import console
+        transition = self.attempt.get('current_transition', target_version)
+        tty = sys.stdout.isatty()
+        start = last_output = last_report = last_warned = time.monotonic()
+        progress = {}
+        with (Path(self.cwd) / 'docker.log').open('a') as stream:
+            process = subprocess.Popen(command, cwd=self.cwd, stdout=subprocess.PIPE,
+                                       stderr=subprocess.STDOUT, text=True, bufsize=1)
+            try:
+                while True:
+                    ready, _, _ = select.select([process.stdout], [], [], 1.0)
+                    now = time.monotonic()
+                    if ready:
+                        line = process.stdout.readline()
+                        if line == '' and process.poll() is not None:
+                            break
+                        if line:
+                            stream.write(line)
+                            stream.flush()
+                            last_output = now
+                            update = self._parse_progress_line(line)
+                            if update:
+                                progress.update(update)
+                    elif process.poll() is not None:
+                        break
+                    if self._heartbeat_due(now, last_output, last_warned):
+                        state, cpu = self._container_health(name)
+                        message = f'No output for {int(now - last_output)}s; container state={state} cpu={cpu}'
+                        logger.warning(message)
+                        console.print('[yellow]' + message + '[/yellow]')
+                        last_warned = now
+                    text = self._progress_text(transition, progress, now - start, now - last_output)
+                    if tty:
+                        sys.stdout.write('\r' + text.ljust(max(len(text), 100)))
+                        sys.stdout.flush()
+                    if now - last_report >= 30:
+                        logger.info(text)
+                        last_report = now
+                return_code = process.wait()
+            except BaseException:
+                process.terminate()
+                try:
+                    process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+                raise
+        if tty:
+            sys.stdout.write('\n')
+        return return_code
+
     def run_upgrade_step(self, target_version):
         self._uom_preflight(target_version)
         prepared = self._prepare_migration_image(target_version)
         image_id = prepared['image_id']
+        self._missing_module_preflight(target_version, prepared)
         name = 'ou-migrate-' + self.attempt['id'].replace('-', '') + '-' + target_version.replace('.', '-')
         self.current_runtime = {'openupgrade': prepared['revision'], 'openupgradelib': LIBRARY_REVISION,
             'image_id': image_id, 'odoo_revision': None, 'odoo_revision_note': 'Official image has no verified Git provenance',
@@ -820,7 +1008,7 @@ USER odoo
             validate_uom(self.uom_rows, factor_fix=script_hash == FACTOR_FIX_SCRIPT_SHA256)
             self.job.save()
         self._runtime_guard(target_version, self.current_runtime)
-        self.job.stage('MIGRATING_' + target_version)
+        self._stage('MIGRATING_' + target_version)
         if name not in self.attempt['containers']:
             self.attempt['containers'].append(name)
         # Persist the write boundary before Docker can start Odoo. Any failure
@@ -837,26 +1025,14 @@ USER odoo
             '--addons-path=/mnt/extra-addons' + (',/mnt/custom-addons' if self.extra_addons else ''),
             '--update=all', '--stop-after-init', '--no-http', '--max-cron-threads=0',
             '--load=base,web,openupgrade_framework', '--log-level=info']
-        log = Path(self.cwd) / 'docker.log'
-        with log.open('a') as stream:
-            process = subprocess.Popen(command, cwd=self.cwd, stdout=stream, stderr=subprocess.STDOUT, text=True)
-            try:
-                return_code = process.wait()
-            except BaseException:
-                process.terminate()
-                try:
-                    process.wait(timeout=10)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    process.wait()
-                raise
+        return_code = self._run_upgrade_container(command, name, target_version)
         state = self._inspect_owned(name, self.attempt['id'])['State']
         if return_code or state['ExitCode'] or state.get('OOMKilled') or state.get('Running', True):
             raise RecoveryError('MIGRATION_EXIT: migration container failed; inspect diagnostics bundle')
         return True
 
     def finalize_package(self):
-        self.job.stage('FINALIZING')
+        self._stage('FINALIZING')
         checkpoint, manifest = self.job.checkpoint()
         # The authoritative checkpoint has already been fully restore/registry tested.
         self._technical(manifest['version'], self.filestore_dir)
@@ -924,7 +1100,7 @@ USER odoo
 
     def _single_copy_checkpoint(self, version):
         """Publish a ZIP after a successful transition without duplicating live data."""
-        self.job.stage('CHECKPOINTING')
+        self._stage('CHECKPOINTING')
         self._single_copy_capacity()
         self._probe('database', self.filestore_dir, self.current_runtime['image_id'])
         validation = self._technical(version, self.filestore_dir, module_mapping=self.current_runtime.get('module_mapping'))
@@ -942,7 +1118,7 @@ USER odoo
 
     def finalize_single_copy_package(self, version):
         """Expose the final checkpoint ZIP as the output without copying bytes."""
-        self.job.stage('FINALIZING')
+        self._stage('FINALIZING')
         checkpoint, manifest = self.job.checkpoint()
         if manifest['version'] != version or manifest.get('checkpoint_format') != 'zip':
             raise RecoveryError('CHECKPOINT_INVALID: final ZIP does not match the target version')
@@ -1012,6 +1188,7 @@ USER odoo
                 self._set_attempt_paths(self.attempt)
             else:
                 self.attempt = self._new_attempt()
+            console.print('Migration log: ' + str(Path(self.cwd) / 'migration.log'))
             self.attempt['runtime']['plan'] = self._runtime_plan()
             try:
                 snapshot = self.job.checkpoint() if resume and self.job.data['latest_checkpoint'] else None
@@ -1042,7 +1219,7 @@ USER odoo
                         console.print('Upgrade complete: ' + str(artifact))
                         console.print('Independent restore verification was not run for this ZIP checkpoint.')
                         return str(artifact)
-                    self.job.stage('INPUT_PREPARATION')
+                    self._stage('INPUT_PREPARATION')
                     if resume:
                         addon = self.job.path / 'inputs' / 'custom_addons'
                         self.extra_addons = str(addon) if addon.exists() else None
@@ -1065,7 +1242,7 @@ USER odoo
                     self.create_db_compose_file()
                     self._run_cmd(self.compose_cmd + ['-f', 'db-composer.yml', 'up', '-d'], capture_output=True)
                     self.wait_for_db()
-                    self.job.stage('RESTORING')
+                    self._stage('RESTORING')
                     if snapshot:
                         directory, manifest = snapshot
                         self.module_baseline = manifest['validation']['modules']
@@ -1110,7 +1287,7 @@ USER odoo
                     transition = {'source': current, 'target': target, 'outcome': 'RUNNING'}
                     self.attempt['transitions'].append(transition)
                     self.attempt['current_transition'] = current + ' -> ' + target
-                    self.job.stage('PREFLIGHT_' + target)
+                    self._stage('PREFLIGHT_' + target)
                     if self.single_copy:
                         self._single_copy_capacity()
                     else:

@@ -100,6 +100,7 @@ def collect(job, exc, evidence=None):
             summary['message'] = restore.get('relevant_error') or 'Restore capacity check failed; inspect storage evidence'
             summary['root_cause'] = restore.get('relevant_error') or 'Insufficient measured restore filesystem capacity'
     summary['failing_module'] = None
+    summary['missing_modules'] = attempt.get('missing_modules')
     docker_log = Path(attempt['work']) / 'docker.log'
     if code != 'DATABASE_RESTORE_FAILURE' and docker_log.is_file():
         with docker_log.open('rb') as stream:

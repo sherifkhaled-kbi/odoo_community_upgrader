@@ -27,7 +27,7 @@ class OdooUpgrader(RecoveryMixin):
     def __init__(self, source: str, target_version: str, extra_addons: Optional[str] = None, verbose: bool = False,
                  postgres_version: str = "13", jobs_dir=None, job_id=None, revisions=None,
                  acceptance=None, reason=None, filestore=None, allow_missing_attachments=False,
-                 single_copy=False, source_version=None):
+                 single_copy=False, source_version=None, skip_missing_modules_check=False):
         self.source = source
         self.target_version = target_version
         self.extra_addons = extra_addons
@@ -40,7 +40,8 @@ class OdooUpgrader(RecoveryMixin):
         self.custom_addons_dir = os.path.join(self.output_dir, 'custom_addons')
         self.compose_cmd = self._get_docker_compose_cmd()
         self._configure_recovery(jobs_dir, job_id, revisions, acceptance, reason, filestore,
-                                 allow_missing_attachments, single_copy, source_version)
+                                 allow_missing_attachments, single_copy, source_version,
+                                 skip_missing_modules_check)
 
     def _run_cmd(self, cmd: List[str], check: bool = True, capture_output: bool = False, timeout=None, stdin=None) -> subprocess.CompletedProcess:
         """Executes a subprocess command and logs it."""

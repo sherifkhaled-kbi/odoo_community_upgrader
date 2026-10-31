@@ -410,10 +410,28 @@ def test_actual_image_capability_probe_guards_18_without_breaking_17(upgrader, m
         return SimpleNamespace(stdout='', stderr='')
     upgrader._run_cmd = command
     upgrader._sql = lambda *a, **k: '13.fixture'
+    upgrader._rows = lambda *a, **k: []  # Not under test here; see test_missing_module_preflight_*.
     upgrader._inspect_owned = lambda *a: {'State': {'ExitCode': 0, 'Running': False}}
     recorded_plan = upgrader._runtime_plan()
     upgrader._runtime_plan = lambda: recorded_plan
-    monkeypatch.setattr('subprocess.Popen', lambda *a, **k: SimpleNamespace(wait=lambda: 0))
+    import os as os_module
+
+    class FakeProcess:
+        """Immediately-finished process whose stdout pipe is already at EOF,
+        so _run_upgrade_container's select()/readline() loop exits right away."""
+        def __init__(self):
+            read_fd, write_fd = os_module.pipe()
+            os_module.close(write_fd)
+            self.stdout = os_module.fdopen(read_fd)
+        def poll(self):
+            return 0
+        def wait(self, timeout=None):
+            return 0
+        def terminate(self):
+            pass
+        def kill(self):
+            pass
+    monkeypatch.setattr('subprocess.Popen', lambda *a, **k: FakeProcess())
     if expected_failure:
         with pytest.raises(AttributeError, match='add_inherits_parent_xmlids'):
             upgrader.run_upgrade_step(target)
@@ -450,3 +468,43 @@ def test_odoo_data_root_is_host_owned_and_probe_copy_is_separate(upgrader):
     upgrader._probe('verify_db', verification_store, 'sha256:test')
     assert str(verification_store.parents[1]) + ':/tmp/ou' in commands[0]
     assert str(root) + ':/tmp/ou' not in commands[0]
+
+
+def test_missing_module_preflight_detects_and_skip_flag_works(upgrader, tmp_path):
+    addons = tmp_path / 'addons'
+    (addons / 'website').mkdir(parents=True)
+    (addons / 'website' / '__manifest__.py').write_text('{}')
+    upgrader.extra_addons = str(addons)
+    upgrader.custom_addons_dir = str(addons)
+    upgrader._image_module_names = lambda image, path: {'base'}
+    upgrader._rows = lambda *a, **k: [
+        {'name': 'base', 'state': 'installed', 'latest_version': '18.0.1.0'},
+        {'name': 'website', 'state': 'installed', 'latest_version': '18.0.1.0'},
+        {'name': 'custom_ext', 'state': 'to upgrade', 'latest_version': '17.0.1.0'},
+        {'name': 'account_payment_term', 'state': 'installed', 'latest_version': '17.0.1.0'},
+    ]
+    prepared = {'image_id': 'sha256:fake', 'environment': {'module_mapping': {'account_payment_term': 'account'}}}
+    with pytest.raises(RecoveryError, match='REGISTRY_VALIDATION') as error:
+        upgrader._missing_module_preflight('18.0', prepared)
+    assert 'custom_ext' in str(error.value)
+    assert 'account_payment_term' not in str(error.value)
+    assert [m['name'] for m in upgrader.attempt['missing_modules']] == ['custom_ext']
+    upgrader.skip_missing_modules_check = True
+    upgrader._missing_module_preflight('18.0', prepared)  # no raise with the override flag
+
+
+@pytest.mark.parametrize(('line', 'expected'), [
+    ("2024-01-01 odoo.modules.loading: Loading module website (61/144)", {'name': 'website', 'i': 61, 'n': 144}),
+    ("2024-01-01 odoo.modules.loading: Modules loaded.", {'stage': 'Modules loaded.'}),
+    ("2024-01-01 odoo.modules.registry: Registry loaded in 12.345s", {'stage': 'Registry loaded in 12.345s'}),
+])
+def test_progress_line_parser(line, expected):
+    assert OdooUpgrader._parse_progress_line(line) == expected
+
+
+def test_heartbeat_warns_after_120s_of_silence():
+    assert OdooUpgrader._heartbeat_due(now=119, last_output=0, last_warned=0) is False
+    assert OdooUpgrader._heartbeat_due(now=120, last_output=0, last_warned=0) is True
+    # Already warned for this silence window; do not repeat until another 120s pass.
+    assert OdooUpgrader._heartbeat_due(now=121, last_output=0, last_warned=120) is False
+    assert OdooUpgrader._heartbeat_due(now=241, last_output=0, last_warned=120) is True

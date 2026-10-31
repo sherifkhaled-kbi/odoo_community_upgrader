@@ -52,9 +52,11 @@ def execute(upgrader):
 @click.option('--source-version', type=click.Choice(OdooUpgrader.VALID_VERSIONS),
               help='Known source major version; prebuild the first migration image before restoring the backup')
 @click.option('--openupgrade-revision', multiple=True, metavar='VERSION=SHA', help='Exact reviewed OpenUpgrade revision for a transition')
+@click.option('--skip-missing-modules-check', is_flag=True,
+              help='Skip the preflight check for installed modules missing from addons-path (unsafe; the upgrade may still fail)')
 @click.pass_context
 def main(ctx, source, version, extra_addons, verbose, postgres_version, log_file, jobs_dir, filestore,
-         allow_missing_attachments, single_copy, source_version, openupgrade_revision):
+         allow_missing_attachments, single_copy, source_version, openupgrade_revision, skip_missing_modules_check):
     """Upgrade Odoo locally using Docker; retain verified recovery checkpoints."""
     logger = logging.getLogger('odooupgrader')
     logger.setLevel(logging.DEBUG if verbose else logging.INFO)
@@ -67,16 +69,19 @@ def main(ctx, source, version, extra_addons, verbose, postgres_version, log_file
         ctx.call_on_close(lambda: (logger.removeHandler(handler), handler.close()))
     ctx.obj = {'jobs_dir': jobs_dir.resolve(), 'verbose': verbose, 'revisions': revisions(openupgrade_revision)}
     if ctx.invoked_subcommand is not None:
-        if source or version or extra_addons or filestore or allow_missing_attachments or single_copy or source_version:
+        if (source or version or extra_addons or filestore or allow_missing_attachments or single_copy
+                or source_version or skip_missing_modules_check):
             raise click.UsageError('Source/version/addons/filestore/attachment/storage options apply only to a new upgrade')
         return
     if not source or not version:
         raise click.UsageError('A new upgrade requires --source and --version; use --help for recovery commands')
+    if skip_missing_modules_check:
+        logger.warning('--skip-missing-modules-check is set: the missing-module preflight will be skipped')
     try:
         upgrader = OdooUpgrader(source, version, extra_addons, verbose, postgres_version,
                                jobs_dir=jobs_dir, revisions=ctx.obj['revisions'], filestore=filestore,
                                allow_missing_attachments=allow_missing_attachments, single_copy=single_copy,
-                               source_version=source_version)
+                               source_version=source_version, skip_missing_modules_check=skip_missing_modules_check)
         execute(upgrader)
     except RecoveryError as exc:
         raise click.ClickException(str(exc)) from exc
@@ -186,16 +191,22 @@ def storage(options, job_id):
 @click.option('--openupgrade-revision', multiple=True, metavar='VERSION=SHA')
 @click.option('--accept-runtime-change', metavar='SHA256', help='Accept the exact reviewed dry-run diff')
 @click.option('--reason', help='Required explanation for an accepted pending runtime correction')
+@click.option('--skip-missing-modules-check', is_flag=True,
+              help='Skip the preflight check for installed modules missing from addons-path (unsafe; the upgrade may still fail)')
 @click.pass_obj
-def resume(options, job_id, dry_run, openupgrade_revision, accept_runtime_change, reason):
+def resume(options, job_id, dry_run, openupgrade_revision, accept_runtime_change, reason, skip_missing_modules_check):
     """Reuse a verified pre-migration workspace or restore the latest ZIP checkpoint."""
     try:
         job = Job(options['jobs_dir'], job_id)
         overrides = dict(options['revisions'])
         overrides.update(revisions(openupgrade_revision))
+        if skip_missing_modules_check:
+            logging.getLogger('odooupgrader').warning(
+                '--skip-missing-modules-check is set: the missing-module preflight will be skipped')
         upgrader = OdooUpgrader('', job.data['target'], verbose=options['verbose'],
             postgres_version=job.data['postgres'], jobs_dir=options['jobs_dir'], job_id=job_id,
-            revisions=overrides, acceptance=accept_runtime_change, reason=reason)
+            revisions=overrides, acceptance=accept_runtime_change, reason=reason,
+            skip_missing_modules_check=skip_missing_modules_check)
         if dry_run:
             click.echo(json.dumps(upgrader.dry_run(), indent=2))
         else:
