@@ -33,11 +33,11 @@ class OdooUpgrader(RecoveryMixin):
         self.extra_addons = extra_addons
         self.verbose = verbose
         self.postgres_version = postgres_version
-        self.cwd = os.getcwd()
-        self.source_dir = os.path.join(self.cwd, 'source')
-        self.output_dir = os.path.join(self.cwd, 'output')
-        self.filestore_dir = os.path.join(self.output_dir, 'filestore')
-        self.custom_addons_dir = os.path.join(self.output_dir, 'custom_addons')
+        # cwd/source_dir/output_dir/filestore_dir/custom_addons_dir are intentionally
+        # not set here: RecoveryMixin._set_attempt_paths() always assigns the real,
+        # attempt-work-directory-relative values before any code path reads them.
+        # Leaving them unset means a future bypass of _set_attempt_paths() raises
+        # AttributeError immediately instead of silently operating on os.getcwd().
         self.compose_cmd = self._get_docker_compose_cmd()
         self._configure_recovery(jobs_dir, job_id, revisions, acceptance, reason, filestore,
                                  allow_missing_attachments, single_copy, source_version,
@@ -217,6 +217,12 @@ class OdooUpgrader(RecoveryMixin):
             except Exception as e:
                 console.print(redact(f"[bold red]Error:[/bold red] Failed to copy local addons: {e}"))
                 raise RecoveryError('INPUT_PREPARATION: source/addon preparation failed; inspect protected logs')
+
+        else:
+            console.print(f"[bold red]Error:[/bold red] Extra addons path not found or not a recognized "
+                          f"source (zip/dir/URL): {redact(self.extra_addons)}")
+            logger.error("Extra addons path not found or not a recognized source")
+            raise RecoveryError('INPUT_PREPARATION: source/addon preparation failed; inspect protected logs')
 
         # Handle directory nesting (common in GitHub downloads), ignoring hidden files
         items = [i for i in os.listdir(self.custom_addons_dir) if not i.startswith('.')]

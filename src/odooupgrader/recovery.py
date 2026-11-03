@@ -21,6 +21,12 @@ from .jobs import Job, RecoveryError, atomic_json, digest, inventory, require_sp
 from .postgres_restore import (RestoreFailure, inspect_dump, select_runtime, validate_runtime, client_version, version_number, sql_failure_evidence)
 
 logger = logging.getLogger('odooupgrader')
+# Dependency/environment evidence that is useful in the migration log but too noisy
+# for the console on every run; propagate=False keeps it off the root console handler
+# while still writing to the same per-attempt migration.log FileHandler.
+file_logger = logging.getLogger('odooupgrader.migration_log')
+file_logger.propagate = False
+file_logger.setLevel(logging.DEBUG)
 
 # Stopgap for OCA/openupgradelib#462 ("lift_constraints: skip not-null constraints"),
 # unmerged as of 2026-10-31: on PostgreSQL 18, lift_constraints('...', 'id', cascade=True)
@@ -52,6 +58,9 @@ class RecoveryMixin:
                             skip_missing_modules_check=False):
         self.jobs_dir = Path(jobs_dir or Path.cwd() / '.odooupgrader' / 'jobs').resolve()
         self.job = Job(self.jobs_dir, job_id) if job_id else None
+        if self.job and self.extra_addons and self.job.data['config'].get('extra_addons'):
+            raise RecoveryError('ADDONS_CHANGED: this job already has retained extra addons; '
+                                'extra addons cannot replace them on resume')
         if self.job and (self.target_version != self.job.data['target'] or self.postgres_version != self.job.data['postgres']):
             raise RecoveryError('JOB_CONFIGURATION: target and PostgreSQL must match the persisted job')
         self.revisions = dict(self.job.data["config"]["runtime_plan"]["openupgrade"] if self.job else OPENUPGRADE_REVISIONS)
@@ -225,6 +234,7 @@ class RecoveryMixin:
         self._handler.addFilter(RedactionFilter())
         self._handler.setLevel(logging.DEBUG)
         logger.addHandler(self._handler)
+        file_logger.addHandler(self._handler)
 
     def _reusable_workspace(self, allow_interrupted_running=False):
         if not self.single_copy or not self.job or not self.job.data['attempts']:
@@ -580,6 +590,12 @@ class RecoveryMixin:
         return unaccounted
 
     @staticmethod
+    def _addons_fingerprint(files):
+        """sha256 of a custom-addons inventory mapping (as returned by jobs.inventory),
+        used to detect drift between a retained addons bundle and what's on disk."""
+        return hashlib.sha256(json.dumps(files, sort_keys=True).encode()).hexdigest()
+
+    @staticmethod
     def _scan_manifest_names(path):
         base = Path(path)
         if not base.is_dir():
@@ -621,15 +637,18 @@ class RecoveryMixin:
                 names = self._manifest_names_in_tar(process.stdout, path_in_image)
             except Exception as exc:
                 process.stdout.close()
-                process.wait()
+                # Drain stderr before wait(): if the child has written more than the
+                # pipe buffer to stderr, waiting first would deadlock (child blocked
+                # writing, parent blocked waiting).
                 stderr = (process.stderr.read() or b'').decode(errors='replace')
                 process.stderr.close()
+                process.wait()
                 raise RecoveryError(f'MODULE_SCAN_FAILED: could not read the {image_ref} export to inspect '
                                     f'{path_in_image}: {redact(stderr[-2048:] or str(exc))}') from exc
             process.stdout.close()
-            return_code = process.wait()
             stderr = (process.stderr.read() or b'').decode(errors='replace')
             process.stderr.close()
+            return_code = process.wait()
             if return_code:
                 raise RecoveryError(f'MODULE_SCAN_FAILED: docker export {image_ref} failed '
                                     f'(exit {return_code}): {redact(stderr[-2048:])}')
@@ -705,13 +724,15 @@ class RecoveryMixin:
         return {'passed': True, 'version': expected, 'modules': sorted(installed), 'attachments': attachment_result}
 
     def _uom_preflight(self, target):
-        if target != '19.0' or 'uom' not in self.module_baseline:
-            return
-        rows = self._rows("SELECT u.category_id AS category, u.factor, u.uom_type AS type, EXISTS (SELECT 1 FROM ir_model_data d WHERE d.model='uom.uom' AND d.res_id=u.id AND d.module != '__export__') AS provider_xmlid FROM uom_uom u")
-        # No filtering on active: upstream reads inactive rows too.
-        validate_uom(rows, factor_fix=True)
-        self.uom_rows = rows
-        self.uom_baseline = self._rows('SELECT id, category_id, factor FROM uom_uom ORDER BY id')
+        # TEMPORARILY DISABLED (2026-11-03): this preflight (and the UOM_UPSTREAM_FACTOR
+        # re-check in run_upgrade_step plus the UOM_EQUIVALENCE checkpoint gate in
+        # _checkpoint/_single_copy_checkpoint) was added preemptively for a customer-specific
+        # Odoo 18->19 UoM concern (docs/implementation/KNOWN_ISSUES.md K001/K002) and is
+        # blocking unrelated clean-database upgrades. Leaving uom_rows/uom_baseline as None
+        # here is sufficient to disable all three downstream checks, since each is gated on
+        # `is not None`. Restore this body (see git history) or design a scoped replacement
+        # when that database is migrated again; do not re-enable via a flag/env toggle.
+        return
 
     def _capacity(self):
         db_bytes = int(self._sql('SELECT pg_database_size(current_database())'))
@@ -724,10 +745,13 @@ class RecoveryMixin:
             raise RecoveryError('DISK_SPACE: PostgreSQL volume lacks verification/restore headroom')
 
     def _single_copy_capacity(self):
-        """Keep a modest reserve; no second database or filestore is created."""
+        """No second live database or filestore is created, but the next checkpoint
+        ZIP still needs room for an uncompressed copy of both (pg_dump + filestore),
+        plus a modest reserve."""
         db_bytes = int(self._sql('SELECT pg_database_size(current_database())'))
+        fs_bytes = sum(x['size'] for x in inventory(self.filestore_dir).values())
         reserve = max(2 * 1024**3, db_bytes // 10)
-        require_space(self.cwd, reserve)
+        require_space(self.cwd, db_bytes + fs_bytes + reserve)
 
     def _normal_image(self, major):
         reference = 'odoo:' + major
@@ -937,16 +961,16 @@ USER odoo
                   "'module_mapping':module_mapping}))")
         env = json.loads(self._run_cmd(['docker', 'run', '--rm', '--network', 'none', '--entrypoint', 'python3', image_id, '-c', probe], capture_output=True).stdout)
         if env['incomplete_distribution_count']:
-            logger.warning('%s Python distributions lack Name/Version metadata; placeholders recorded in runtime inventory',
-                           env['incomplete_distribution_count'])
+            file_logger.warning('%s Python distributions lack Name/Version metadata; placeholders recorded in runtime inventory',
+                                env['incomplete_distribution_count'])
         new_conflicts, preexisting_conflicts = self._dependency_conflicts('odoo:' + target_version, image_id)
         if new_conflicts:
             raise RecoveryError('DEPENDENCY_ERROR: OpenUpgrade/custom-addon requirements introduced new package '
                                 'conflicts not present in the base odoo:' + target_version + ' image: ' + '; '.join(new_conflicts))
         if preexisting_conflicts:
-            logger.warning('Ignoring %d dependency conflict(s) already present in the unmodified base odoo:%s image '
-                           '(not introduced by this build): %s', len(preexisting_conflicts), target_version,
-                           '; '.join(preexisting_conflicts))
+            file_logger.warning('Ignoring %d dependency conflict(s) already present in the unmodified base odoo:%s image '
+                                '(not introduced by this build): %s', len(preexisting_conflicts), target_version,
+                                '; '.join(preexisting_conflicts))
         prepared = {'revision': revision, 'image_id': image_id, 'environment': env,
                     'application_fingerprint': fingerprint, 'addons_sha256': addons_sha256,
                     'preexisting_dependency_conflicts': preexisting_conflicts}
@@ -1184,6 +1208,10 @@ USER odoo
             self._write_compact_checkpoint_zip(stage / 'checkpoint.zip', version, validation)
             return validation
         self.job.publish(version, self.current_runtime, build)
+        # Single-copy mode never reads anything but the latest checkpoint (there is
+        # no fallback-to-older-checkpoint logic), so older ones are pure accumulated
+        # disk usage once the new one's ledger entry is durably committed above.
+        self.job.prune_checkpoints(keep=1)
         return validation
 
     def finalize_single_copy_package(self, version):
@@ -1274,17 +1302,17 @@ USER odoo
                         if not addon.is_dir():
                             raise RecoveryError('ADDONS_CHANGED: retained custom addons missing')
                         saved_addons = inventory(addon)
-                        saved_hash = hashlib.sha256(json.dumps(saved_addons, sort_keys=True).encode()).hexdigest()
+                        saved_hash = self._addons_fingerprint(saved_addons)
                         if (saved_addons != inventory(self.custom_addons_dir) or
                                 saved_hash != self.job.data['config'].get('addons_sha256')):
                             raise RecoveryError('ADDONS_CHANGED: retained custom addons changed')
                         self.extra_addons = str(addon)
-                    elif self.extra_addons:
+                    elif self.extra_addons and not addon.exists():
                         # First time this job is given extra addons; adopt and retain them like a fresh job would.
                         self.process_extra_addons()
                         shutil.copytree(self.custom_addons_dir, addon)
-                        self.job.data['config'].update(extra_addons=True, addons_sha256=hashlib.sha256(
-                            json.dumps(inventory(self.custom_addons_dir), sort_keys=True).encode()).hexdigest())
+                        self.job.data['config'].update(extra_addons=True,
+                            addons_sha256=self._addons_fingerprint(inventory(self.custom_addons_dir)))
                         self.job.save()
                     current = self._reuse_workspace()
                 else:
@@ -1300,7 +1328,7 @@ USER odoo
                     addon = self.job.path / 'inputs' / 'custom_addons'
                     if resume and addon.exists():
                         self.extra_addons = str(addon)
-                        current_hash = hashlib.sha256(json.dumps(inventory(addon), sort_keys=True).encode()).hexdigest()
+                        current_hash = self._addons_fingerprint(inventory(addon))
                         if current_hash != self.job.data['config'].get('addons_sha256'):
                             raise RecoveryError('ADDONS_CHANGED: retained source bundle is corrupt or modified')
                     elif not resume:
@@ -1310,8 +1338,8 @@ USER odoo
                     self.process_extra_addons()
                     if self.extra_addons and not addon.exists():
                         shutil.copytree(self.custom_addons_dir, addon)
-                        self.job.data['config'].update(extra_addons=True, addons_sha256=hashlib.sha256(
-                            json.dumps(inventory(self.custom_addons_dir), sort_keys=True).encode()).hexdigest())
+                        self.job.data['config'].update(extra_addons=True,
+                            addons_sha256=self._addons_fingerprint(inventory(self.custom_addons_dir)))
                         self.job.save()
                     preflight_version = snapshot[1]['version'] if snapshot else self.source_version_hint
                     source_image_id = self._normal_image(preflight_version) if preflight_version and not snapshot else None
@@ -1422,4 +1450,5 @@ USER odoo
                                  type(exc).__name__, exc)
                 if self._handler:
                     logger.removeHandler(self._handler)
+                    file_logger.removeHandler(self._handler)
                     self._handler.close()

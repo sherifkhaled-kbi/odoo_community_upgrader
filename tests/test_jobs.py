@@ -33,6 +33,27 @@ def test_checkpoint_and_corruption(tmp_path):
     assert len(j.data['completed']) == 2
 
 
+def test_prune_checkpoints_keeps_only_latest(tmp_path):
+    """DB-001 regression: single-copy mode must not accumulate one full checkpoint
+    per completed transition forever; pruning must leave the ledger history intact
+    (checkpoint() still resolves the latest entry correctly) while removing the
+    on-disk payload of older ones."""
+    j = job(tmp_path)
+    j.publish('17.0', {}, snapshot)
+    j.prune_checkpoints(keep=1)
+    j.publish('18.0', {}, snapshot)
+    j.prune_checkpoints(keep=1)
+    latest = j.publish('19.0', {}, snapshot)
+    j.prune_checkpoints(keep=1)
+
+    remaining = [p.name for p in (j.path / 'checkpoints').iterdir()]
+    assert remaining == [latest['id']]
+    assert len(j.data['completed']) == 3  # Ledger history is never touched by pruning.
+    path, manifest = j.checkpoint()
+    assert manifest['version'] == '19.0'
+    assert path.name == latest['id']
+
+
 def test_missing_checkpoint(tmp_path):
     j = job(tmp_path)
     j.publish('18.0', {}, snapshot)

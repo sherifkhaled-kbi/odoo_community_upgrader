@@ -236,6 +236,41 @@ def test_preexisting_upstream_dependency_conflict_does_not_block_build(upgrader)
         'maxminddb 2.5.2 has requirement setuptools>=68.2.2, but you have setuptools 68.1.2.']
 
 
+def test_preexisting_dependency_warning_goes_to_migration_log_not_console(upgrader):
+    """The preexisting-conflict/incomplete-metadata notices are useful evidence but
+    too noisy to print on every run; they must land in migration.log only, never
+    propagate to the console/root logger. Uses a plain handler attached directly to
+    the root logger (not pytest's caplog, which installs its capture handlers on
+    every logger regardless of propagate and would mask a regression here)."""
+    import logging
+    upgrader._uom_preflight = lambda target: None
+    base = _stub_build_and_probe()
+
+    def command(cmd, **kwargs):
+        if cmd[-3:] == ['-m', 'pip', 'check']:
+            return SimpleNamespace(returncode=1,
+                stdout='maxminddb 2.5.2 has requirement setuptools>=68.2.2, but you have setuptools 68.1.2.\n',
+                stderr='')
+        return base(cmd, **kwargs)
+    upgrader._run_cmd = command
+
+    seen = []
+
+    class Collector(logging.Handler):
+        def emit(self, record):
+            seen.append(record.getMessage())
+    root_handler = Collector()
+    logging.getLogger().addHandler(root_handler)
+    try:
+        upgrader._prepare_migration_image('18.0')
+    finally:
+        logging.getLogger().removeHandler(root_handler)
+
+    assert not any('dependency conflict' in message for message in seen)
+    log_text = (Path(upgrader.cwd) / 'migration.log').read_text()
+    assert 'dependency conflict' in log_text
+
+
 def test_new_dependency_conflict_introduced_by_build_is_fatal(upgrader):
     """A conflict absent from the untouched base image but present after our own
     OpenUpgrade/custom-addon installs must still block migration."""
@@ -376,6 +411,28 @@ def test_uom_equivalence_accepts_changed_root_but_rejects_inversion():
     verify_uom_ratios(before, [{'id': 1, 'factor': 1000}, {'id': 2, 'factor': 24000}])
     with pytest.raises(RecoveryError, match='UOM_EQUIVALENCE'):
         verify_uom_ratios(before, [{'id': 1, 'factor': 1}, {'id': 2, 'factor': 1/24}])
+
+
+def test_uom_preflight_is_disabled_and_leaves_no_baseline(upgrader):
+    upgrader.module_baseline = ['base', 'uom']
+    bad_rows = [{'category': 1, 'factor': -1, 'type': 'bigger', 'provider_xmlid': False}]
+    upgrader._rows = lambda *args, **kwargs: bad_rows
+    upgrader._uom_preflight('19.0')
+    assert upgrader.uom_rows is None
+    assert upgrader.uom_baseline is None
+
+
+def test_disabled_uom_preflight_means_checkpoint_never_calls_verify_uom_ratios(upgrader, monkeypatch):
+    import odooupgrader.checks as checks
+    def fail(*args, **kwargs):
+        pytest.fail('verify_uom_ratios must not run while _uom_preflight is disabled')
+    monkeypatch.setattr(checks, 'verify_uom_ratios', fail)
+    upgrader._stage = lambda name: None
+    upgrader._capacity = lambda: None
+    upgrader._technical = lambda *args, **kwargs: {'passed': True}
+    upgrader.job.publish = lambda major, runtime, build: None
+    assert upgrader.uom_baseline is None
+    upgrader._checkpoint('19.0', {'module_mapping': {}})
 
 
 @pytest.mark.parametrize('target,helper,expected_failure', [('17.0', False, False), ('18.0', True, False), ('18.0', False, True)])
@@ -568,6 +625,139 @@ def test_missing_module_preflight_fails_loudly_when_scan_cannot_find_base(upgrad
     prepared = {'image_id': 'sha256:fake', 'environment': {'module_mapping': {}}}
     with pytest.raises(RecoveryError, match='MODULE_SCAN_FAILED'):
         upgrader._missing_module_preflight('18.0', prepared)
+
+
+def test_image_module_scan_drains_stderr_before_waiting_on_export_failure(upgrader, monkeypatch):
+    """MIG-003 regression: stderr must be read before wait() so a child that writes
+    more than the OS pipe buffer to stderr while blocked can't deadlock the scan."""
+    import io
+
+    def command(cmd, **kwargs):
+        if cmd[:2] == ['docker', 'create']:
+            return SimpleNamespace(stdout='containerid\n', stderr='')
+        return SimpleNamespace(stdout='', stderr='', returncode=0)
+    upgrader._run_cmd = command
+
+    order = []
+
+    class FakeStderr:
+        def __init__(self):
+            self._data = io.BytesIO(b'boom')
+
+        def read(self):
+            order.append('stderr_read')
+            return self._data.read()
+
+        def close(self):
+            pass
+
+    class FakeProcess:
+        def __init__(self):
+            self.stdout = io.BytesIO(b'')  # Invalid/empty tar -> _manifest_names_in_tar raises.
+            self.stderr = FakeStderr()
+
+        def wait(self, timeout=None):
+            order.append('wait')
+            return 1
+    monkeypatch.setattr('subprocess.Popen', lambda *a, **k: FakeProcess())
+    with pytest.raises(RecoveryError, match='MODULE_SCAN_FAILED'):
+        upgrader._image_module_names('odoo:18.0', '/some/path')
+    assert order == ['stderr_read', 'wait']
+
+
+def test_single_copy_capacity_rejects_checkpoint_that_wont_fit(upgrader, monkeypatch):
+    """DB-002 regression: the capacity check must account for the full DB+filestore
+    bytes the next checkpoint ZIP will contain, not just ~10% of the DB size (or a
+    flat 2 GiB floor), which previously let a doomed multi-GB checkpoint attempt
+    start on a host that could never hold it."""
+    import shutil
+    big_db_bytes = 20 * 1024**3  # 20 GiB
+    upgrader._sql = lambda *a, **k: str(big_db_bytes)
+    free_bytes = 5 * 1024**3  # Enough under the old 2 GiB floor; not enough for 20+ GiB.
+    monkeypatch.setattr('odooupgrader.jobs.shutil.disk_usage',
+                        lambda path: shutil._ntuple_diskusage(0, 0, free_bytes))
+    with pytest.raises(RecoveryError, match='DISK_SPACE'):
+        upgrader._single_copy_capacity()
+
+
+def test_resume_extra_addons_skips_recopy_when_already_adopted(upgrader):
+    """MIG-001 regression: if a prior --extra-addons adoption on a single-copy
+    reusable-workspace resume crashed after copying the addons directory but before
+    committing config['extra_addons']=True, resuming again must not crash with an
+    unhandled FileExistsError."""
+    upgrader.single_copy = True
+    upgrader.job.data['config']['single_copy'] = True
+    upgrader.job.data['config']['extra_addons'] = False
+    upgrader.job.data['source_version'] = '18.0'
+    upgrader.extra_addons = '/some/addons/path'  # Content is irrelevant to this branch.
+
+    addon = upgrader.job.path / 'inputs' / 'custom_addons'
+    addon.mkdir(parents=True)  # Simulates the half-completed previous attempt.
+
+    upgrader.attempt.update(outcome='FAILED',
+        workspace_ready={'version': '18.0', 'db_container_id': 'x', 'filestore_sha256': 'y',
+                         'modules': [], 'runtime': {}})
+    upgrader.job.save()
+
+    upgrader.assert_local_docker = lambda: None
+    upgrader._plan_change = lambda **k: (None, None)
+    upgrader._stop_attempt = lambda *a, **k: None
+
+    sentinel = RuntimeError('reached _reuse_workspace')
+
+    def boom():
+        raise sentinel
+    upgrader._reuse_workspace = boom
+
+    with pytest.raises(RuntimeError) as excinfo:
+        upgrader.run()
+    assert excinfo.value is sentinel
+    assert addon.is_dir()  # The stale directory was left alone, not crashed into.
+
+
+def test_process_extra_addons_rejects_unrecognized_source(upgrader, tmp_path):
+    """MIG-002 regression: a bad/missing --extra-addons value must raise loudly
+    instead of silently leaving custom_addons_dir empty and getting adopted as-is."""
+    upgrader.extra_addons = str(tmp_path / 'does-not-exist')
+    with pytest.raises(RecoveryError, match='INPUT_PREPARATION'):
+        upgrader.process_extra_addons()
+
+
+def test_engine_rejects_extra_addons_replacement_without_cli(tmp_path, monkeypatch):
+    """ARCH-003 regression: the 'cannot replace retained extra addons on resume'
+    invariant must be enforced by the engine itself (not only cli.py), so any
+    caller that bypasses the CLI is still protected."""
+    monkeypatch.setattr(OdooUpgrader, '_get_docker_compose_cmd', lambda self: ['docker', 'compose'])
+    config = {'runtime_plan': {'openupgrade': {}, 'openupgradelib': None, 'application_commit': None,
+                               'application_version': '0.4.0', 'application_fingerprint': 'x'},
+              'extra_addons': True}
+    job = Job.create(tmp_path, '19.0', '13', config)
+    with pytest.raises(RecoveryError, match='ADDONS_CHANGED'):
+        OdooUpgrader('', '19.0', extra_addons='/some/new/addons', postgres_version='13',
+                     jobs_dir=tmp_path, job_id=job.id)
+
+
+def test_cwd_based_paths_are_not_set_before_attempt_paths(monkeypatch, tmp_path):
+    """ARCH-001 regression: cwd/source_dir/output_dir/filestore_dir/custom_addons_dir
+    must not be silently defaulted from os.getcwd() in __init__; they should not
+    exist at all until RecoveryMixin._set_attempt_paths() assigns the real values."""
+    monkeypatch.setattr(OdooUpgrader, '_get_docker_compose_cmd', lambda self: ['docker', 'compose'])
+    u = OdooUpgrader('source.zip', '19.0', jobs_dir=tmp_path)
+    for attr in ('cwd', 'source_dir', 'output_dir', 'filestore_dir', 'custom_addons_dir'):
+        assert not hasattr(u, attr)
+
+
+def test_addons_fingerprint_matches_manual_hash(upgrader, tmp_path):
+    """ARCH-002 regression: the shared _addons_fingerprint helper must produce the
+    same digest as the inline hashlib/json expression it replaces."""
+    import hashlib
+    from odooupgrader.jobs import inventory
+    sample = tmp_path / 'sample_addons'
+    (sample / 'mod').mkdir(parents=True)
+    (sample / 'mod' / '__manifest__.py').write_text('{}')
+    files = inventory(sample)
+    expected = hashlib.sha256(json.dumps(files, sort_keys=True).encode()).hexdigest()
+    assert upgrader._addons_fingerprint(files) == expected
 
 
 @pytest.mark.parametrize(('line', 'expected'), [

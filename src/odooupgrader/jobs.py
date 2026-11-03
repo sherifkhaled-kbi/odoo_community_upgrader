@@ -183,6 +183,11 @@ class Job:
                 if str(uuid.UUID(item['id'])) != item['id']:
                     raise ValueError()
                 saved = self.path / 'checkpoints' / item['id'] / 'manifest.json'
+                if not saved.exists():
+                    # Pruned by single-copy retention (prune_checkpoints); the ledger
+                    # entry above is the only remaining record for this one.
+                    parent = item['id']
+                    continue
                 if digest(saved) != item['manifest_sha256']:
                     raise ValueError()
                 prior = json.loads(saved.read_text())
@@ -250,6 +255,18 @@ class Job:
             transitions[-1].update(outcome='SUCCEEDED', checkpoint=identifier)
         self.save()
         return entry
+
+    def prune_checkpoints(self, keep=1):
+        """Delete on-disk checkpoint directories beyond the most recent `keep`
+        completed entries. The ledger (self.data['completed']) is never modified —
+        only a pruned entry's checkpoint payload directory is removed; checkpoint()
+        treats a missing historical directory as prior intentional pruning, not
+        corruption."""
+        stale = self.data['completed'][:-keep] if keep > 0 else self.data['completed']
+        for entry in stale:
+            directory = self.path / 'checkpoints' / entry['id']
+            if directory.is_dir():
+                shutil.rmtree(directory, ignore_errors=True)
 
     def observed_state(self):
         """Read-only liveness hint; execution always rechecks under the exclusive lock."""
