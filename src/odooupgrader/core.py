@@ -14,10 +14,10 @@ from .diagnostics import redact
 
 import requests
 from packaging import version
-from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn, TimeElapsedColumn
 
-console = Console()
+from .ui import console
+
 logger = logging.getLogger("odooupgrader")
 
 

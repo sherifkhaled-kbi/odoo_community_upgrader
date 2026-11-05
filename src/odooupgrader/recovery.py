@@ -19,6 +19,7 @@ from .checks import FACTOR_FIX_SCRIPT_SHA256, LIBRARY_REVISION, OPENUPGRADE_REVI
 from .diagnostics import RedactionFilter, collect, redact
 from .jobs import Job, RecoveryError, atomic_json, digest, inventory, require_space, sync_dir
 from .postgres_restore import (RestoreFailure, inspect_dump, select_runtime, validate_runtime, client_version, version_number, sql_failure_evidence)
+from .ui import print_failure_summary, print_header, print_success_summary
 
 logger = logging.getLogger('odooupgrader')
 # Dependency/environment evidence that is useful in the migration log but too noisy
@@ -1233,6 +1234,75 @@ USER odoo
                                      'independent_restore_verified': False}
         return destination
 
+    def _publish_artifact(self, source_path, version):
+        """Publish the finalized ZIP into <jobs-dir>/Complete/ with a checksum sidecar.
+        No-op if this job already has a durable, verified publication on disk."""
+        published = self.job.data.get('published_artifact')
+        if published:
+            existing = Path(published['path'])
+            if existing.is_file() and not existing.is_symlink() and digest(existing) == published['sha256']:
+                return published
+        source_path = Path(source_path)
+        source_sha256 = digest(source_path)
+        complete_dir = self.jobs_dir / 'Complete'
+        complete_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        name = f'{self.job.id}__{version}__{time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())}'
+        destination = complete_dir / (name + '.zip')
+        checksum_path = complete_dir / (name + '.sha256')
+        if destination.exists() or checksum_path.exists():
+            raise RecoveryError(f'ARTIFACT_PUBLISH_CONFLICT: {destination.name} already exists in Complete/')
+        require_space(complete_dir, source_path.stat().st_size)
+        temp_zip = complete_dir / ('.' + name + '.zip.' + uuid.uuid4().hex + '.part')
+        try:
+            shutil.copyfile(source_path, temp_zip)
+            with temp_zip.open('rb') as stream:
+                os.fsync(stream.fileno())
+            try:
+                with zipfile.ZipFile(temp_zip) as archive:
+                    if archive.testzip() is not None:
+                        raise RecoveryError('ARTIFACT_INVALID: published ZIP failed integrity verification')
+            except zipfile.BadZipFile:
+                raise RecoveryError('ARTIFACT_INVALID: published ZIP failed integrity verification')
+            published_sha256 = digest(temp_zip)
+            if published_sha256 != source_sha256:
+                raise RecoveryError('ARTIFACT_INVALID: published ZIP checksum does not match the finalized artifact')
+            os.chmod(temp_zip, 0o400)
+            os.replace(temp_zip, destination)
+            sync_dir(complete_dir)
+        finally:
+            temp_zip.unlink(missing_ok=True)
+        checksum_temp = complete_dir / ('.' + name + '.sha256.' + uuid.uuid4().hex + '.part')
+        try:
+            checksum_temp.write_text(f'{published_sha256}  {destination.name}\n')
+            with checksum_temp.open('rb') as stream:
+                os.fsync(stream.fileno())
+            os.chmod(checksum_temp, 0o400)
+            os.replace(checksum_temp, checksum_path)
+            sync_dir(complete_dir)
+        finally:
+            checksum_temp.unlink(missing_ok=True)
+        record = {'path': str(destination), 'checksum_path': str(checksum_path), 'sha256': published_sha256}
+        self.job.data['published_artifact'] = record
+        self.job.save()
+        return record
+
+    def _success_summary(self, published, version, started, ended):
+        manifest = self.job.checkpoint()[1]
+        versions = []
+        source_version = self.job.data.get('source_version')
+        if source_version:
+            versions.append(source_version)
+        for entry in self.job.data['completed']:
+            if not versions or versions[-1] != entry['version']:
+                versions.append(entry['version'])
+        if not versions:
+            versions = [version]
+        print_success_summary(
+            job_id=self.job.id, upgrade_path=' → '.join(versions), final_version=version,
+            duration_seconds=ended - started, final_zip=published['path'], checksum_path=published['checksum_path'],
+            independent_restore_verified=manifest['validation'].get('independent_restore', True),
+            storage_mode='single_copy' if self.single_copy else 'normal')
+
     def failure_evidence(self):
         evidence = {}
         if self._database_restored and not self._restore_failed:
@@ -1265,11 +1335,14 @@ USER odoo
                 {'runtime_plan': self._runtime_plan(), 'extra_addons': bool(self.extra_addons),
                  'allow_missing_attachments': self.allow_missing_attachments,
                  'single_copy': self.single_copy, 'source_version': self.source_version_hint})
-        console.print('Job ID: ' + self.job.id)
-        if self.single_copy:
-            console.print('Storage mode: one working database/filestore; ZIP checkpoint after each successful version')
+        print_header(self.job.id, self.job.data.get('source_version'), self.target_version,
+                     'single-copy (no independent restore verification)' if self.single_copy else 'normal')
         with self.job.lock():
             if self.job.data['state'] == 'COMPLETED':
+                published = self._publish_artifact(self.job.data['artifact']['path'], self.job.data['target'])
+                last_attempt = self.job.data['attempts'][-1]
+                self._success_summary(published, self.job.data['target'], last_attempt['started'],
+                                      last_attempt.get('ended') or last_attempt['started'])
                 return self.job.data['artifact']['path']
             previous_attempts = list(self.job.data['attempts'])
             reusable = self._reusable_workspace(allow_interrupted_running=True) if resume else None
@@ -1318,11 +1391,11 @@ USER odoo
                 else:
                     if self.single_copy and snapshot and snapshot[1]['version'] == self.target_version:
                         artifact = self.finalize_single_copy_package(self.target_version)
+                        published = self._publish_artifact(artifact, self.target_version)
                         self.attempt.update(outcome='SUCCEEDED', ended=time.time())
                         self.job.data.update(state='COMPLETED', stage='COMPLETED')
                         self.job.save()
-                        console.print('Upgrade complete: ' + str(artifact))
-                        console.print('Independent restore verification was not run for this ZIP checkpoint.')
+                        self._success_summary(published, self.target_version, self.attempt['started'], self.attempt['ended'])
                         return str(artifact)
                     self._stage('INPUT_PREPARATION')
                     addon = self.job.path / 'inputs' / 'custom_addons'
@@ -1413,12 +1486,11 @@ USER odoo
                 if self.single_copy and self.job.data['latest_checkpoint'] is None:
                     self._single_copy_checkpoint(current)
                 artifact = self.finalize_single_copy_package(current) if self.single_copy else self.finalize_package()
+                published = self._publish_artifact(artifact, current)
                 self.attempt.update(outcome='SUCCEEDED', ended=time.time())
                 self.job.data.update(state='COMPLETED', stage='COMPLETED')
                 self.job.save()
-                console.print('Upgrade complete: ' + str(artifact))
-                if self.single_copy:
-                    console.print('Independent restore verification was not run for this ZIP checkpoint.')
+                self._success_summary(published, current, self.attempt['started'], self.attempt['ended'])
                 return str(artifact)
             except BaseException as exc:
                 self.attempt.update(outcome='INTERRUPTED' if isinstance(exc, (KeyboardInterrupt, SystemExit)) else 'FAILED', ended=time.time())
@@ -1436,11 +1508,16 @@ USER odoo
                     raw_trace.chmod(0o600)
                 except Exception:
                     logger.error('Private traceback could not be saved')
+                bundle = None
                 try:
                     bundle = collect(self.job, exc, self.failure_evidence())
-                    console.print('Diagnostics bundle: ' + str(bundle))
                 except Exception:
                     logger.error('Diagnostics collection failed; original failure preserved')
+                message = str(exc).split(':', 1)[0]
+                error_code = message if isinstance(exc, RecoveryError) else type(exc).__name__
+                print_failure_summary(job_id=self.job.id, failed_stage=self.job.data.get('stage'),
+                                      error_code=error_code, duration_seconds=self.attempt['ended'] - self.attempt['started'],
+                                      diagnostics_path=bundle)
                 raise
             finally:
                 try:
