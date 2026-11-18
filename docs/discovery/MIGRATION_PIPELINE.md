@@ -1,0 +1,30 @@
+# Migration pipeline and state safety
+
+**Basis:** application `49c16285eb160b11d8a977bba278bf3a3bc333f1`. This is a static call trace; no database upgrade, Docker operation, or backup was run.
+
+| Stage | Source and function | Dependency / effect | Failure handling and risk |
+| --- | --- | --- | --- |
+| 1. CLI input | [cli.py:15-70](../../src/odooupgrader/cli.py#L15-L70), `main` | Click validates target against 10.0–19.0 | File type, size, free disk, DB identity and module readiness unvalidated |
+| 2. Source reachability | [core.py:80-121](../../src/odooupgrader/core.py#L80-L121), `validate_source_accessibility` | GET/HEAD or `exists` | Exits on access error; not a content or integrity check |
+| 3. Reset workspace | [core.py:123-142](../../src/odooupgrader/core.py#L123-L142), `prepare_environment` | Removes `cwd/source` and `cwd/output`; creates output directories | Cleanup errors only warn; can erase prior outputs before successful run |
+| 4. Addons | [core.py:182-295](../../src/odooupgrader/core.py#L182-L295), `process_extra_addons` | Download/extract/copy; normalize layout; write empty requirements if missing | `extractall` has no size/path policy; external Python requirements installed during image build; no manifest/version analysis |
+| 5. PostgreSQL | [core.py:313-356](../../src/odooupgrader/core.py#L313-L356), `create_db_compose_file`, `wait_for_db` | `postgres:<option>` default 13, fixed container/network/volume | 30 readiness polls; no isolation against concurrent run or existing container |
+| 6. Acquire input | [core.py:144-180](../../src/odooupgrader/core.py#L144-L180), `download_file`, `download_or_copy_source` | Remote download into CWD or local path | No checksum/size limit; URL logged; downloaded same-name file may collide |
+| 7. Extract / stage | [core.py:297-311](../../src/odooupgrader/core.py#L297-L311), `process_source_file` | ZIP extracted to `source/`; other extension copied as `database.dump` | ZIP content not validated before extraction; non-ZIP assumed pg custom dump |
+| 8. Restore | [core.py:358-408](../../src/odooupgrader/core.py#L358-L408), `restore_database` | `createdb`; ZIP SQL via `psql`; DUMP via `pg_restore` | `createdb` and `pg_restore` use `check=False`; `psql` lacks `ON_ERROR_STOP`; partial restore may proceed |
+| 9. Version | [core.py:409-445](../../src/odooupgrader/core.py#L409-L445), `get_current_version` and parsers | Three SQL fallbacks, `packaging.version`; increments major | Query uses `check=False`; errors can be mistaken for empty; no version lineage/edition check |
+| 10. Step plan | [core.py:682-711](../../src/odooupgrader/core.py#L682-L711), `run` | One target major at a time; same/higher target packages current DB | No preflight on OpenUpgrade coverage; no checkpoint between majors |
+| 11. Build | [core.py:446-535](../../src/odooupgrader/core.py#L446-L535), `run_upgrade_step` | `odoo:<major>`, moving OCA branch, pinned library, generated Compose | Build and dependency failures return false; image/branch/runtime not pinned |
+| 12. Execute | [core.py:538-601](../../src/odooupgrader/core.py#L538-L601), `run_upgrade_step` | Compose `up --build --abort-on-container-exit`; Odoo `-u all` | Reads stdout before stderr; stderr pipe can fill; checks Compose then container exit; no log semantic parsing |
+| 13. Script discovery and order | [Odoo 19 `MigrationManager`](https://github.com/odoo/odoo/blob/a5447ae78fa15f25e69ce44fd154bf1d2f1e383a/odoo/modules/migration.py), OCA framework patches | Per-module version dirs, pre → module initialization → post, end after modules | Odoo transaction semantics apply within each stage; wrapper has no per-stage checkpoint |
+| 14. Requery | [core.py:710-711](../../src/odooupgrader/core.py#L710-L711), `run` | Reads base version after each container exit | Empty or unchanged version can loop/retry; no explicit progress invariant |
+| 15. Package | [core.py:603-629](../../src/odooupgrader/core.py#L603-L629), `finalize_package` | `pg_dump` SQL + copied filestore into ZIP | No restore validation, attachment count/hash check, module state check, or functional UAT |
+| 16. Cleanup | [core.py:631-720](../../src/odooupgrader/core.py#L631-L720), `cleanup_artifacts`, `cleanup` | Removes extracted files and runs `db-composer down -v` in finally | Failure destroys temporary DB volume; failed process may retain Odoo container; fixed names may affect another run |
+
+## State and recovery
+
+`CONFIRMED` The source is read/copied, so ordinary execution does not directly write to the source DB; however the application trusts user-supplied local paths and operates on a database restored into a fixed Docker volume. No snapshot is taken after restore or between versions. `pg_restore --single-transaction` offers transactionality for its own restore command, but its return code is ignored; SQL `psql -f` does not request stop-on-error. Odoo may commit module work across its own loading lifecycle; the wrapper has no atomic transaction spanning versions. A failed migration can leave the temporary DB partially upgraded until `finally` removes the volume. [core.py:363-408](../../src/odooupgrader/core.py#L363-L408), [649-720](../../src/odooupgrader/core.py#L649-L720).
+
+`CONFIRMED` There is no retry/resume API. A rerun starts by deleting `source/` and `output/`, then creates a fresh temporary volume if Compose cleanup succeeded. Repeating an individual OpenUpgrade script against a partially changed DB is **not established safe**; upstream migration scripts may perform one-time transformations. File copy, download, and image build may be repeated, but they can select different moving upstream revisions. `NOT VERIFIED` Crash/kill behavior, disk exhaustion behavior, and actual Odoo transaction boundaries were not exercised.
+
+`CONFIRMED` Final ZIP includes filestore only if copying succeeded; copy failure is merely logged as a warning ([core.py:375-390](../../src/odooupgrader/core.py#L375-L390)). Inventory, accounting, custom module, Enterprise, attachment, and relational integrity have no application-level verification gate before completion ([core.py:603-629](../../src/odooupgrader/core.py#L603-L629)).
