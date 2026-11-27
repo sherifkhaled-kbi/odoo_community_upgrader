@@ -8,7 +8,7 @@ import click
 from rich.logging import RichHandler
 
 from .core import OdooUpgrader
-from .diagnostics import RedactionFilter
+from .diagnostics import RedactionFilter, render_report
 from .jobs import Job, RecoveryError, allocated_bytes
 
 logging.basicConfig(level=logging.INFO, format='%(message)s',
@@ -221,8 +221,9 @@ def resume(options, job_id, dry_run, openupgrade_revision, accept_runtime_change
 @main.command('diagnostics')
 @click.argument('job_id')
 @click.option('--output', type=click.Path(path_type=Path), help='Copy latest existing bundle to a new path')
+@click.option('--report', is_flag=True, help='Print an organized, readable failure report from the bundle')
 @click.pass_obj
-def diagnostics(options, job_id, output):
+def diagnostics(options, job_id, output, report):
     """Locate or export the latest sanitized failure ZIP; no registry initialization."""
     try:
         job = Job(options['jobs_dir'], job_id)
@@ -230,12 +231,17 @@ def diagnostics(options, job_id, output):
         bundle = next((p for p in bundles if p.is_file()), None)
         if bundle is None:
             raise RecoveryError('NO_DIAGNOSTICS: no completed bundle is available')
+        attempt_id = bundle.stem
         if output:
             with output.open('xb') as destination, bundle.open('rb') as source:
                 shutil.copyfileobj(source, destination)
             output.chmod(0o600)
             bundle = output
-        click.echo(str(bundle.resolve()))
+        if report:
+            work = next((Path(a['work']) for a in job.data['attempts'] if a['id'] == attempt_id and a.get('work')), None)
+            click.echo(render_report(bundle, work))
+        else:
+            click.echo(str(bundle.resolve()))
     except (RecoveryError, OSError) as exc:
         raise click.ClickException('Diagnostics export failed: ' + (str(exc) if isinstance(exc, RecoveryError) else type(exc).__name__)) from exc
 

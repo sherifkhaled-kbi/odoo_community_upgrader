@@ -1,5 +1,7 @@
 """Read-only source validation rules; no source normalization or upstream patch."""
+import ast
 import math
+import re
 from pathlib import Path, PurePosixPath
 import stat
 import zipfile
@@ -33,6 +35,49 @@ def extract_zip(filename, destination, limit=200 * 1024**3):
                 raise RecoveryError('INPUT_UNSAFE: archive path/link/duplicate entry rejected')
             seen.add(path.as_posix())
         archive.extractall(destination)
+
+
+def _requirement_name(spec):
+    """Bare, normalized project name from a requirement line or manifest entry."""
+    name = re.split(r'[\s\[;@<>=!~]', spec.split('#', 1)[0].strip(), maxsplit=1)[0]
+    return re.sub(r'[-_.]+', '-', name).lower()
+
+
+def check_python_dependencies(addons_dir):
+    """Return {module: sorted packages} for manifest python dependencies absent from requirements.txt.
+
+    Read-only: manifests are parsed with ast.literal_eval, never executed or imported.
+    Unparseable manifests are skipped silently.
+    """
+    addons_dir = Path(addons_dir)
+    req_path = addons_dir / 'requirements.txt'
+    declared_reqs = set()
+    if req_path.is_file():
+        for line in req_path.read_text(encoding='utf-8', errors='replace').splitlines():
+            line = line.split('#', 1)[0].strip()
+            if not line or line.startswith('-'):
+                continue
+            declared_reqs.add(_requirement_name(line))
+
+    missing = {}
+    for module_dir in sorted(p for p in addons_dir.iterdir() if p.is_dir()):
+        manifest_path = next((module_dir / f for f in ('__manifest__.py', '__openerp__.py')
+                              if (module_dir / f).is_file()), None)
+        if manifest_path is None:
+            continue
+        try:
+            manifest = ast.literal_eval(manifest_path.read_text(encoding='utf-8', errors='replace'))
+        except Exception:
+            continue
+        if not isinstance(manifest, dict):
+            continue
+        external = manifest.get('external_dependencies') or {}
+        packages = external.get('python', []) if isinstance(external, dict) else []
+        absent = sorted({str(p).strip() for p in packages
+                         if str(p).strip() and _requirement_name(str(p)) not in declared_reqs})
+        if absent:
+            missing[module_dir.name] = absent
+    return missing
 
 
 def validate_uom(rows, factor_fix=False):

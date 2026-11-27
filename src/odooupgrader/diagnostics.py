@@ -151,3 +151,123 @@ def collect(job, exc, evidence=None):
     os.chmod(temporary, 0o600)
     os.replace(temporary, destination)
     return destination
+
+
+REPORT_LOG_LINES = 40
+REPORT_JSON_LINES = 60
+
+
+def _fmt(value):
+    if value is None or value == []:
+        return '-'
+    if isinstance(value, list):
+        return ', '.join(str(item) for item in value)
+    return str(value)
+
+
+def _render(archive, bundle_path, work_dir):
+    def text(name):
+        try:
+            return archive.read(name).decode('utf-8', errors='replace')
+        except Exception:
+            return None
+
+    def data(name):
+        try:
+            return json.loads(text(name))
+        except Exception:
+            return None
+
+    def tail(name):
+        content = text(name)
+        if content is None or content.strip() == 'Unavailable':
+            return None
+        return content.splitlines()[-REPORT_LOG_LINES:]
+
+    out = []
+
+    def section(title, body):
+        out.append(f'=== {title} ===')
+        out.extend(body or ['unavailable'])
+        out.append('')
+
+    summary = data('failure_summary.json')
+    body = []
+    if isinstance(summary, dict):
+        rows = [('Job', 'job_id'), ('Attempt', 'attempt_id'), ('Transition', 'transition'), ('Stage', 'stage'),
+                ('Error code', 'code'), ('Failing module', 'failing_module'), ('Missing modules', 'missing_modules'),
+                ('SQLSTATE', 'sqlstate'), ('Exit code', 'process_exit_code')]
+        rows += [(label, key) for label, key in
+                 (('Restore category', 'category'), ('Relevant error', 'relevant_error'),
+                  ('Recommended action', 'recommended_action'))
+                 if summary.get(key) is not None]
+        body = [f'  {label + ":":<20}{_fmt(summary.get(key))}' for label, key in rows]
+    section('SUMMARY', body)
+
+    section('TRACEBACK', (text('error_traceback.txt') or '').rstrip('\n').splitlines() or None)
+
+    body = []
+    for name in ('docker.log', 'migration.log'):
+        body.append(f'-- {name} (last {REPORT_LOG_LINES} lines)')
+        body.extend(tail(name) or ['unavailable'])
+        body.append('')
+    section('LAST LOG LINES', body[:-1])
+
+    steps = data('migration_steps.json')
+    body = []
+    if isinstance(steps, list):
+        for step in steps:
+            if not isinstance(step, dict):
+                continue
+            transitions = '; '.join(f"{t.get('source')} -> {t.get('target')}: {t.get('outcome')}"
+                                    for t in step.get('transitions') or [] if isinstance(t, dict))
+            body.append(f"{step.get('id')}  outcome={step.get('outcome')}  {transitions or 'no transitions'}")
+    section('MIGRATION STEPS', body or None)
+
+    body = []
+    for name in ('module_status.json', 'docker_status.json'):
+        parsed = data(name)
+        body.append(f'-- {name}')
+        if parsed is None:
+            body.append('unavailable')
+        else:
+            lines = json.dumps(parsed, indent=2, sort_keys=True).splitlines()
+            body.extend(lines[:REPORT_JSON_LINES])
+            if len(lines) > REPORT_JSON_LINES:
+                body.append('... (truncated)')
+        body.append('')
+    section('MODULE / DOCKER STATUS', body[:-1])
+
+    body = []
+    try:
+        if work_dir is not None and Path(work_dir).is_dir():
+            body.append('Unredacted private logs for local review only; do not share or upload them.')
+            for path in sorted(Path(work_dir).iterdir()):
+                if path.is_file() and not path.is_symlink():
+                    body.append(f'  {path.resolve()}  ({path.stat().st_size / 1024:.1f} KB)')
+            if len(body) == 1:
+                body.append('  no regular files')
+    except OSError:
+        body = []
+    section('RAW LOCAL LOGS', body or ['not available'])
+
+    out.append(f'Full diagnostics ZIP: {bundle_path.resolve()}')
+    return '\n'.join(out)
+
+
+def render_report(bundle_path, work_dir=None):
+    """Readable failure report from a bundle; never raises, unreadable parts are shown as unavailable."""
+    bundle_path = Path(bundle_path)
+    try:
+        archive = zipfile.ZipFile(bundle_path)
+    except Exception:
+        archive = None
+    try:
+        if archive is None:
+            raise OSError('bundle could not be opened')
+        return _render(archive, bundle_path, work_dir)
+    except Exception:
+        return f'Report unavailable: bundle could not be read.\n\nFull diagnostics ZIP: {bundle_path}'
+    finally:
+        if archive is not None:
+            archive.close()

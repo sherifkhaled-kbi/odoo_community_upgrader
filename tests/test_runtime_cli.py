@@ -723,6 +723,16 @@ def test_process_extra_addons_rejects_unrecognized_source(upgrader, tmp_path):
         upgrader.process_extra_addons()
 
 
+def test_process_extra_addons_rejects_missing_python_dependency(upgrader, tmp_path):
+    """Custom addon manifests declaring a python package absent from requirements.txt fail before the upgrade."""
+    src = tmp_path / 'local_addons' / 'mod_a'
+    src.mkdir(parents=True)
+    (src / '__manifest__.py').write_text("{'external_dependencies': {'python': ['not_installed_pkg']}}")
+    upgrader.extra_addons = str(tmp_path / 'local_addons')
+    with pytest.raises(RecoveryError, match='DEPENDENCY_ERROR'):
+        upgrader.process_extra_addons()
+
+
 def test_engine_rejects_extra_addons_replacement_without_cli(tmp_path, monkeypatch):
     """ARCH-003 regression: the 'cannot replace retained extra addons on resume'
     invariant must be enforced by the engine itself (not only cli.py), so any
@@ -775,3 +785,17 @@ def test_heartbeat_warns_after_120s_of_silence():
     # Already warned for this silence window; do not repeat until another 120s pass.
     assert OdooUpgrader._heartbeat_due(now=121, last_output=0, last_warned=120) is False
     assert OdooUpgrader._heartbeat_due(now=241, last_output=0, last_warned=120) is True
+
+
+
+def test_process_extra_addons_flat_layout_keeps_root_requirements(upgrader, tmp_path):
+    """A flat single-module addon's own requirements.txt must stay at the root the image build installs."""
+    src = tmp_path / 'flat'
+    src.mkdir()
+    (src / '__manifest__.py').write_text("{'external_dependencies': {'python': ['some_pkg']}}")
+    (src / 'requirements.txt').write_text('some-pkg>=1\n')
+    upgrader.extra_addons = str(src)
+    upgrader.process_extra_addons()
+    root = Path(upgrader.custom_addons_dir)
+    assert (root / 'requirements.txt').read_text() == 'some-pkg>=1\n'
+    assert (root / 'downloaded_module' / '__manifest__.py').exists()
