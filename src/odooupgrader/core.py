@@ -8,7 +8,7 @@ import logging
 from typing import Optional, List
 from pathlib import Path
 from .recovery import RecoveryMixin
-from .checks import extract_zip
+from .checks import extract_zip, check_python_dependencies
 from .jobs import RecoveryError, require_space, inventory
 from .diagnostics import redact
 
@@ -257,7 +257,8 @@ class OdooUpgrader(RecoveryMixin):
             for item in items:
                 src = os.path.join(self.custom_addons_dir, item)
                 dst = os.path.join(sub_folder_path, item)
-                if src != sub_folder_path:
+                # requirements.txt must stay at the root: the image build installs only that file.
+                if src != sub_folder_path and item != "requirements.txt":
                     shutil.move(src, dst)
 
         # Ensure requirements.txt exists
@@ -267,6 +268,15 @@ class OdooUpgrader(RecoveryMixin):
                 f.write("")
         elif os.path.getsize(req_path) == 0:
             logger.warning("Empty requirements.txt found in custom addons.")
+
+        # Fail fast: the migration image only pip-installs requirements.txt, so manifest
+        # python dependencies missing from it would break the base upgrade later.
+        missing_python = check_python_dependencies(self.custom_addons_dir)
+        if missing_python:
+            raise RecoveryError('DEPENDENCY_ERROR: custom addons declare Python dependencies missing from '
+                                'requirements.txt: ' + '; '.join(f'{m}: {", ".join(p)}'
+                                                                 for m, p in missing_python.items())
+                                + '. Add them to requirements.txt in the custom addons folder and run again.')
 
         # Standardize permissions for Docker compatibility
         logger.info("Standardizing addon permissions...")

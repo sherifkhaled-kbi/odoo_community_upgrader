@@ -89,3 +89,46 @@ def test_reviewed_upstream_fix_hash_is_exact():
     from pathlib import Path
     from odooupgrader.checks import FACTOR_FIX_SCRIPT_SHA256
     assert hashlib.sha256((Path(__file__).parent / 'fixtures/uom_pr6054.py').read_bytes()).hexdigest() == FACTOR_FIX_SCRIPT_SHA256
+
+
+def _addon(root, name, manifest):
+    module = root / name
+    module.mkdir(parents=True)
+    (module / '__manifest__.py').write_text(repr(manifest))
+    return module
+
+
+def test_python_dependency_missing_is_reported(tmp_path):
+    from odooupgrader.checks import check_python_dependencies
+    _addon(tmp_path, 'mod_a', {'external_dependencies': {'python': ['xlsxwriter', 'Pillow']}})
+    (tmp_path / 'requirements.txt').write_text('xlsxwriter==3.1.9\n')
+    assert check_python_dependencies(tmp_path) == {'mod_a': ['Pillow']}
+
+
+def test_python_dependency_present_with_spec_normalization_passes(tmp_path):
+    from odooupgrader.checks import check_python_dependencies
+    _addon(tmp_path, 'mod_a', {'external_dependencies': {'python': ['python_dateutil', 'Pillow', 'zeep']}})
+    (tmp_path / 'requirements.txt').write_text(
+        '# comment\n'
+        '-r other.txt\n'
+        '\n'
+        'python-dateutil>=2.8 ; python_version >= "3"\n'
+        'pillow[webp]~=10.0\n'
+        'zeep @ https://example.com/zeep.whl\n')
+    assert check_python_dependencies(tmp_path) == {}
+
+
+def test_no_external_dependencies_passes(tmp_path):
+    from odooupgrader.checks import check_python_dependencies
+    _addon(tmp_path, 'mod_a', {'name': 'A'})
+    _addon(tmp_path, 'mod_b', {'external_dependencies': {'bin': ['wkhtmltopdf']}})
+    assert check_python_dependencies(tmp_path) == {}
+
+
+def test_unparseable_manifest_is_skipped(tmp_path):
+    from odooupgrader.checks import check_python_dependencies
+    bad = tmp_path / 'broken'
+    bad.mkdir()
+    (bad / '__manifest__.py').write_text("{'external_dependencies': exec('import os')}")
+    _addon(tmp_path, 'mod_a', {'external_dependencies': {'python': ['pkg']}})
+    assert check_python_dependencies(tmp_path) == {'mod_a': ['pkg']}

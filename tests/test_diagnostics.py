@@ -2,8 +2,8 @@ import json
 import subprocess
 import zipfile
 import pytest
-from odooupgrader.diagnostics import collect, redact, structural_log
-from odooupgrader.jobs import Job
+from odooupgrader.diagnostics import collect, redact, render_report, structural_log
+from odooupgrader.jobs import Job, RecoveryError
 
 
 @pytest.mark.parametrize('exc', [ValueError('customer Acme 123 secret'),
@@ -46,3 +46,63 @@ def test_redaction_and_sql_payload_filtering():
 @pytest.mark.parametrize('text', ['--db_password hidden', 'POSTGRES_PASSWORD=hidden', '"password": "hidden value"', "api_key='hidden value'", 'Authorization: Bearer hidden'])
 def test_redact_cli_json_and_quoted_credentials(text):
     assert 'hidden' not in redact(text)
+
+
+def test_render_report_organizes_bundle_sections(tmp_path):
+    j = Job.create(tmp_path, '19.0', '13', {})
+    a = j.begin()
+    work = j.path / 'attempts' / a['id']
+    work.mkdir()
+    a['work'] = str(work)
+    (work / 'migration.log').write_text('module uom: Running upgrade [19.0] post-migration\n')
+    (work / 'docker.log').write_text('module uom: Running upgrade [19.0] post-migration\n')
+    j.save()
+    try:
+        raise RecoveryError('UOM_FACTOR: ratio mismatch')
+    except RecoveryError as original:
+        path = collect(j, original)
+    report = render_report(path, work)
+    headers = ['=== SUMMARY ===', '=== TRACEBACK ===', '=== LAST LOG LINES ===', '=== MIGRATION STEPS ===',
+               '=== MODULE / DOCKER STATUS ===', '=== RAW LOCAL LOGS ===']
+    positions = [report.index(header) for header in headers]
+    assert positions == sorted(positions)
+    assert 'UOM_FACTOR' in report
+    assert 'Failing module:' in report and 'uom' in report
+    assert str(path.resolve()) in report
+    assert str((work / 'migration.log').resolve()) in report
+    assert 'unredacted' in report.lower()
+
+
+def test_render_report_tolerates_missing_and_invalid_entries(tmp_path):
+    bundle = tmp_path / 'bundle.zip'
+    with zipfile.ZipFile(bundle, 'w') as archive:
+        archive.writestr('failure_summary.json', '{not json')
+        archive.writestr('README.md', 'partial bundle')
+    report = render_report(bundle)
+    assert '=== SUMMARY ===' in report and '=== RAW LOCAL LOGS ===' in report
+    assert 'unavailable' in report
+    assert 'not available' in report
+    assert str(bundle.resolve()) in report
+    assert 'Report unavailable' in render_report(tmp_path / 'missing.zip')
+
+
+def test_diagnostics_cli_report_flag(tmp_path):
+    from click.testing import CliRunner
+    from odooupgrader.cli import main
+    j = Job.create(tmp_path, '19.0', '13', {})
+    a = j.begin()
+    work = j.path / 'attempts' / a['id']
+    work.mkdir()
+    a['work'] = str(work)
+    (work / 'docker.log').write_text('module uom: Running upgrade [19.0] post-migration\n')
+    j.save()
+    try:
+        raise RecoveryError('UOM_FACTOR: ratio mismatch')
+    except RecoveryError as original:
+        path = collect(j, original)
+    runner = CliRunner()
+    plain = runner.invoke(main, ['--jobs-dir', str(tmp_path), 'diagnostics', j.id])
+    assert plain.exit_code == 0 and plain.output.strip() == str(path.resolve())
+    result = runner.invoke(main, ['--jobs-dir', str(tmp_path), 'diagnostics', j.id, '--report'])
+    assert result.exit_code == 0
+    assert '=== SUMMARY ===' in result.output and str((work / 'docker.log').resolve()) in result.output
