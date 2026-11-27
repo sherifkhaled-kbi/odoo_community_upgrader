@@ -132,3 +132,11 @@ def test_unparseable_manifest_is_skipped(tmp_path):
     (bad / '__manifest__.py').write_text("{'external_dependencies': exec('import os')}")
     _addon(tmp_path, 'mod_a', {'external_dependencies': {'python': ['pkg']}})
     assert check_python_dependencies(tmp_path) == {'mod_a': ['pkg']}
+
+
+def test_python_dependencies_ignore_standard_library(tmp_path):
+    from odooupgrader.checks import check_python_dependencies
+    mod = tmp_path / 'mod'
+    mod.mkdir()
+    (mod / '__manifest__.py').write_text("{'external_dependencies': {'python': ['ftplib', 'paramiko']}}")
+    assert check_python_dependencies(tmp_path) == {'mod': ['paramiko']}

@@ -2,6 +2,7 @@
 import ast
 import math
 import re
+import sys
 from pathlib import Path, PurePosixPath
 import stat
 import zipfile
@@ -73,8 +74,10 @@ def check_python_dependencies(addons_dir):
             continue
         external = manifest.get('external_dependencies') or {}
         packages = external.get('python', []) if isinstance(external, dict) else []
+        # Standard-library names (e.g. ftplib) need no install; Odoo accepts them by import.
         absent = sorted({str(p).strip() for p in packages
-                         if str(p).strip() and _requirement_name(str(p)) not in declared_reqs})
+                         if str(p).strip() and _requirement_name(str(p)) not in declared_reqs
+                         and str(p).strip().split('.')[0] not in getattr(sys, 'stdlib_module_names', ())})
         if absent:
             missing[module_dir.name] = absent
     return missing
